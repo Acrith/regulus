@@ -12,15 +12,41 @@ from scoring import audit
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-MOD_CHANNEL_ID = int(os.getenv("MOD_CHANNEL_ID", "0"))
+
+
+def _parse_guilds(raw: str) -> dict[int, int]:
+    if not raw or not raw.strip():
+        raise SystemExit(
+            "GUILDS is empty; expected 'guild_id:mod_channel_id' pairs, comma-separated"
+        )
+    result: dict[int, int] = {}
+    for i, pair in enumerate(raw.split(","), start=1):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            raise SystemExit(
+                f"GUILDS entry #{i} is malformed: '{pair}' "
+                "(expected 'guild_id:mod_channel_id')"
+            )
+        guild_part, channel_part = pair.split(":", 1)
+        try:
+            guild_id = int(guild_part.strip())
+            channel_id = int(channel_part.strip())
+        except ValueError:
+            raise SystemExit(
+                f"GUILDS entry #{i}: guild_id and mod_channel_id must be integers "
+                f"(got '{pair}')"
+            )
+        result[guild_id] = channel_id
+    if not result:
+        raise SystemExit("GUILDS contained no valid pairs after parsing")
+    return result
+
 
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN missing from .env")
-if not GUILD_ID:
-    raise SystemExit("GUILD_ID missing from .env")
-if not MOD_CHANNEL_ID:
-    raise SystemExit("MOD_CHANNEL_ID missing from .env")
+GUILDS: dict[int, int] = _parse_guilds(os.getenv("GUILDS", ""))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,41 +59,49 @@ intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-_GUILD = discord.Object(id=GUILD_ID)
 
 
 @bot.event
 async def setup_hook():
-    synced = await bot.tree.sync(guild=_GUILD)
-    log.info("synced %d slash command(s) to guild %s", len(synced), GUILD_ID)
+    for guild_id in GUILDS:
+        guild = discord.Object(id=guild_id)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        log.info("synced %d slash command(s) to guild %s", len(synced), guild_id)
 
 
 @bot.event
 async def on_ready():
     log.info("logged in as %s (id=%s)", bot.user, bot.user.id)
     for guild in bot.guilds:
-        log.info("  connected to guild: %s (id=%s, members=%s)",
-                 guild.name, guild.id, guild.member_count)
-    channel = bot.get_channel(MOD_CHANNEL_ID)
-    if channel is None:
-        log.warning("mod channel id=%s not visible to bot; audit posts will fail",
-                    MOD_CHANNEL_ID)
-    else:
-        log.info("  mod channel: #%s (id=%s)", channel.name, channel.id)
+        marker = "" if guild.id in GUILDS else "  (not configured — events ignored)"
+        log.info("  guild: %s (id=%s, members=%s)%s",
+                 guild.name, guild.id, guild.member_count, marker)
+        if guild.id in GUILDS:
+            channel = bot.get_channel(GUILDS[guild.id])
+            if channel is None:
+                log.warning("    mod channel %s not visible in this guild",
+                            GUILDS[guild.id])
+            else:
+                log.info("    mod channel: #%s (id=%s)", channel.name, channel.id)
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.bot:
         return
+    mod_channel_id = GUILDS.get(member.guild.id)
+    if mod_channel_id is None:
+        return
 
     result = await audit(member, bot)
-    log.info("member joined: %s (id=%s, score=%+d, band=%s)",
-             member, member.id, result.score, result.band)
+    log.info("member joined: %s (id=%s, guild=%s, score=%+d, band=%s)",
+             member, member.id, member.guild.id, result.score, result.band)
 
-    channel = bot.get_channel(MOD_CHANNEL_ID)
+    channel = bot.get_channel(mod_channel_id)
     if channel is None:
-        log.error("cannot post audit: mod channel %s unresolved", MOD_CHANNEL_ID)
+        log.error("cannot post audit: mod channel %s unresolved for guild %s",
+                  mod_channel_id, member.guild.id)
         return
 
     embed = build_audit_embed(member, result)
@@ -89,7 +123,6 @@ async def _reply_with_audit(interaction: discord.Interaction, member: discord.Me
 @bot.tree.command(
     name="audit",
     description="Run the trust audit on a member and show the result.",
-    guild=_GUILD,
 )
 @app_commands.describe(member="The member to audit")
 @app_commands.default_permissions(manage_messages=True)
@@ -97,7 +130,7 @@ async def audit_command(interaction: discord.Interaction, member: discord.Member
     await _reply_with_audit(interaction, member)
 
 
-@bot.tree.context_menu(name="Audit user", guild=_GUILD)
+@bot.tree.context_menu(name="Audit user")
 @app_commands.default_permissions(manage_messages=True)
 async def audit_context_menu(interaction: discord.Interaction, member: discord.Member) -> None:
     await _reply_with_audit(interaction, member)

@@ -37,7 +37,7 @@ In the [Developer Portal](https://discord.com/developers/applications):
 
 ### 3. Create the mod-audit channel
 
-In your server, create a text channel (e.g. `#mod-audit`), restrict it to moderator roles, and make sure the bot can view and send messages there (Administrator covers this during development). Enable Developer Mode in Discord (User Settings → Advanced), then right-click the channel → Copy Channel ID.
+For **each** server the bot will operate in, create a text channel (e.g. `#mod-audit`), restrict it to moderator roles, and make sure the bot can view and send messages there (Administrator covers this during development). Enable Developer Mode in Discord (User Settings → Advanced), then right-click each channel → Copy Channel ID. Also copy each server's ID (right-click server icon → Copy Server ID).
 
 ### 4. Configure
 
@@ -47,11 +47,22 @@ Copy the template and fill it in:
 cp .env.example .env            # Windows: copy .env.example .env
 ```
 
-| Variable         | Required | Description                                                                                                     |
-|------------------|----------|-----------------------------------------------------------------------------------------------------------------|
-| `DISCORD_TOKEN`  | yes      | Bot token from the Developer Portal.                                                                            |
-| `GUILD_ID`       | yes      | Server ID. Enable Developer Mode in Discord (User Settings → Advanced), then right-click server → Copy Server ID. |
-| `MOD_CHANNEL_ID` | yes      | Channel ID for the mod-audit channel (see Setup step 3). Audit embeds are posted here on each member join.      |
+| Variable        | Required | Description                                                              |
+|-----------------|----------|--------------------------------------------------------------------------|
+| `DISCORD_TOKEN` | yes      | Bot token from the Developer Portal.                                     |
+| `GUILDS`        | yes      | Comma-separated pairs of `guild_id:mod_channel_id`. See below.           |
+
+#### Multi-server setup
+
+`GUILDS` lists every server the bot should operate in, each paired with the mod-audit channel for that server:
+
+```
+GUILDS=1234567890:9876543210,2222222222:3333333333
+```
+
+- Format is `guild_id:mod_channel_id`, pairs comma-separated. Whitespace is tolerated.
+- The bot **ignores any server it happens to be in but that is not listed here** — no commands sync, no join audits are posted. This is safe by default: adding the bot to a new server has no effect until you list it.
+- A single server is a valid config (one pair, no comma).
 
 ## Running
 
@@ -59,15 +70,21 @@ cp .env.example .env            # Windows: copy .env.example .env
 python bot.py
 ```
 
-Expected startup output:
+Expected startup output (with two configured servers):
 
 ```
+INFO  regulus  synced 2 slash command(s) to guild 1234567890
+INFO  regulus  synced 2 slash command(s) to guild 2222222222
 INFO  regulus  logged in as Regulus (id=…)
-INFO  regulus    connected to guild: <server> (id=…, members=…)
-INFO  regulus    mod channel: #<name> (id=…)
+INFO  regulus    guild: Test Server (id=1234567890, members=3)
+INFO  regulus      mod channel: #mod-audit (id=9876543210)
+INFO  regulus    guild: Live Server (id=2222222222, members=530)
+INFO  regulus      mod channel: #mod-audit (id=3333333333)
 ```
 
-When a member joins the configured server, the bot:
+If the bot is in a server that is not listed in `GUILDS`, it is logged as `(not configured — events ignored)`.
+
+When a member joins a **configured** server, the bot:
 
 1. Fetches the full User object once (needed for banner and some profile data not present on the cached Member).
 2. Computes a trust score from account signals and picks a band.
@@ -101,7 +118,7 @@ Available to any user with the `Manage Messages` permission (adjustable per-comm
 | `/audit member:@user`                   | Runs the trust audit on `@user` and returns the audit embed.      |
 | Right-click a user → **Apps → Audit user** | Same as `/audit`, invoked via context menu.                     |
 
-Commands are guild-scoped and sync at startup — they appear in Discord within a second or two of the bot connecting.
+Commands are guild-scoped and sync at startup for every server listed in `GUILDS` — they appear in Discord within a second or two of the bot connecting.
 
 ## Repository layout
 
