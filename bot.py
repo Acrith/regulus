@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Optional, Union
 
@@ -514,6 +515,31 @@ _UNVERIFIED_DENY_KEYS = (
     "mention_everyone", "use_application_commands",
 )
 
+_CHANNEL_MENTION_RE = re.compile(r"<#(\d+)>")
+
+
+def _parse_open_channels(raw: str, guild: discord.Guild) -> set[str]:
+    """Return a lowercase set of channel names for the open-channels allowlist.
+
+    Accepts both plain names (`welcome`, `#welcome`) and Discord channel
+    mentions (`<#1234567890>`) — the latter is what the slash-command UI
+    produces when the operator types `#` and picks a channel from autocomplete.
+    Unknown mentions are silently dropped.
+    """
+    names: set[str] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        m = _CHANNEL_MENTION_RE.fullmatch(token)
+        if m is not None:
+            channel = guild.get_channel(int(m.group(1)))
+            if channel is not None:
+                names.add(channel.name.lower())
+        else:
+            names.add(token.lower().lstrip("#"))
+    return names
+
 
 def _make_unverified_overwrite(can_view: bool, is_voice: bool) -> discord.PermissionOverwrite:
     overwrite = discord.PermissionOverwrite()
@@ -533,7 +559,7 @@ def _make_unverified_overwrite(can_view: bool, is_voice: bool) -> discord.Permis
 )
 @app_commands.describe(
     role_name="Name for the role (default: Unverified)",
-    open_channels="Comma-separated channel names Unverified can still view (e.g. 'welcome,rules')",
+    open_channels="Channels Unverified can still view (comma-separated). Names or #mentions both work.",
 )
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
@@ -560,10 +586,7 @@ async def setup_unverified_command(
         )
         return
 
-    open_names = {
-        n.strip().lower().lstrip("#")
-        for n in open_channels.split(",") if n.strip()
-    }
+    open_names = _parse_open_channels(open_channels, guild)
 
     role = discord.utils.get(guild.roles, name=role_name)
     created = False
