@@ -119,6 +119,32 @@ async def setup_hook():
         log.info("synced %d slash command(s) to guild %s", len(synced), guild_id)
 
 
+async def _bootstrap_members(guild: discord.Guild) -> None:
+    """Create a members row for each current guild member missing one.
+
+    Bot downtime means we miss on_member_join for anyone who arrived while
+    we were offline; without a bootstrap they'd have no behavioural
+    tracking data ever. We fill joined_at from Discord's canonical
+    member.joined_at; invite is unknown (we never observed the diff).
+    """
+    created = 0
+    for member in guild.members:
+        if member.bot:
+            continue
+        existing = await db.get_member_record(member.id, guild.id)
+        if existing is not None:
+            continue
+        joined = member.joined_at or datetime.now(timezone.utc)
+        await db.upsert_member_join(
+            member.id, guild.id,
+            joined.isoformat(timespec="seconds"),
+            None,
+        )
+        created += 1
+    if created:
+        log.info("bootstrapped %d member record(s) for guild %s", created, guild.id)
+
+
 @bot.event
 async def on_ready():
     log.info("logged in as %s (id=%s)", bot.user, bot.user.id)
@@ -134,6 +160,7 @@ async def on_ready():
             else:
                 log.info("    mod channel: #%s (id=%s)", channel.name, channel.id)
             await invites.refresh(guild)
+            await _bootstrap_members(guild)
 
 
 @bot.event
@@ -228,6 +255,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     )
 
 
+_FIRST_MSG_RECORD_WINDOW_SECONDS = 24 * 3600
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or message.guild is None:
@@ -237,6 +267,14 @@ async def on_message(message: discord.Message):
 
     record = await db.get_member_record(message.author.id, message.guild.id)
     if record is None or record.first_message_at is not None:
+        return
+
+    # If they joined more than 24h ago and we still have no first_message_at,
+    # this cannot be their real first message — bot was down when it happened
+    # or the record was bootstrapped for an already-active member. Recording
+    # this message would lie about the timing.
+    joined_ago = _elapsed_since(record.joined_at)
+    if joined_ago > _FIRST_MSG_RECORD_WINDOW_SECONDS:
         return
 
     now_iso = _now_iso()

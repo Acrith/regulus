@@ -85,6 +85,8 @@ INFO  regulus      mod channel: #mod-audit (id=3333333333)
 
 If the bot is in a server that is not listed in `GUILDS`, it is logged as `(not configured — events ignored)`.
 
+On every startup the bot **bootstraps** the `members` table by walking each configured guild's current member list and creating a row for anyone missing one, using Discord's canonical `member.joined_at`. Invite is left null (we never observed the diff). Onboarding completion is not backfilled with a timestamp — instead the `Onboarding speed` signal detects "completed but timing missed" from the current member state and reports honestly. Bootstrap runs quickly (a few hundred members complete in under a second) and is safe to re-run — it only touches members with no existing record.
+
 When a member joins a **configured** server, the bot:
 
 1. Identifies which invite was used (invite-uses diff against the cache).
@@ -114,8 +116,8 @@ Current signals, defined in `scoring.py`:
 | Server booster      | `member.premium_since`               | 0 or +3            | Boosting the current guild — strong positive.                                                      |
 | Public flags        | `member.public_flags`                | −1 to +3           | HypeSquad / Nitro Early / Active Developer / etc. Limited set exposed by the API.                 |
 | Username pattern    | regex on `member.name`               | −2 or 0            | Trailing `\d{4,}$` — the `word####` scam signature.                                                |
-| Onboarding speed    | `members.onboarding_completed_at`    | −3 to +1           | Seconds between join and onboarding completion. <5s: speedrun. <30s: fast. 30s–30m: normal. >30m: deliberate. |
-| First message timing | `members.first_message_at`          | −2 or 0            | Seconds between join and first message. <30s: posted immediately (bot-like). Otherwise neutral for now — content-based scoring lands with hot triggers. |
+| Onboarding speed    | `members.onboarding_completed_at`    | −3 to +1           | Seconds between join and onboarding completion. <5s: speedrun. <30s: fast. 30s–30m: normal. >30m: deliberate. If the member state shows completion but the bot missed the event (was down), the signal reports so honestly at weight 0. |
+| First message timing | `members.first_message_at`          | −2 or 0            | Seconds between join and first message. <30s: posted immediately (bot-like). Otherwise neutral for now — content-based scoring lands with hot triggers. Messages from members whose `joined_at` is more than 24h old are not recorded as "first" — the real first message must have happened while the bot was offline. |
 
 The **Discord API deliberately hides several profile signals from bots** (connections such as Twitch or X, nameplate, display-name colour, profile widgets, current Nitro subscription state for other users). Static scoring therefore has a real ceiling; behavioural triggers and a local blocklist (see below) will close the gap for well-disguised accounts.
 

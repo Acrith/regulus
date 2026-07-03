@@ -179,34 +179,54 @@ def _signal_username_pattern(ctx: AuditContext) -> Signal:
 
 def _signal_onboarding_speed(ctx: AuditContext) -> Signal:
     record = ctx.member_record
+    member = ctx.member
+    completed_flag = getattr(member.flags, "completed_onboarding", False)
+
     if record is None:
-        return Signal("Onboarding speed", "no record (joined before bot deployed)", 0)
-    if record.onboarding_completed_at is None:
-        return Signal("Onboarding speed", "pending / not completed", 0)
-    elapsed = (_parse_ts(record.onboarding_completed_at) - _parse_ts(record.joined_at)).total_seconds()
-    if elapsed < 5:
-        weight, note = -3, "speedrun"
-    elif elapsed < 30:
-        weight, note = -1, "fast, no reading"
-    elif elapsed < 30 * 60:
-        weight, note = 0, "normal"
-    else:
-        weight, note = 1, "deliberate"
-    return Signal("Onboarding speed", f"{fmt_duration(elapsed)} — {note}", weight)
+        if completed_flag:
+            return Signal("Onboarding speed", "completed (no record — bot was not tracking)", 0)
+        return Signal("Onboarding speed", "no record", 0)
+
+    if record.onboarding_completed_at is not None:
+        elapsed = (_parse_ts(record.onboarding_completed_at)
+                   - _parse_ts(record.joined_at)).total_seconds()
+        if elapsed < 5:
+            weight, note = -3, "**speedrun**"
+        elif elapsed < 30:
+            weight, note = -1, "fast, no reading"
+        elif elapsed < 30 * 60:
+            weight, note = 0, "normal"
+        else:
+            weight, note = 1, "deliberate"
+        return Signal("Onboarding speed", f"{fmt_duration(elapsed)} — {note}", weight)
+
+    if completed_flag:
+        return Signal("Onboarding speed",
+                       "completed (timing missed — bot was down for the event)", 0)
+    if member.pending:
+        return Signal("Onboarding speed", "still pending screening", 0)
+    return Signal("Onboarding speed",
+                   "not completed or no screening required", 0)
 
 
 def _signal_first_message_timing(ctx: AuditContext) -> Signal:
     record = ctx.member_record
     if record is None:
-        return Signal("First message", "no record (joined before bot deployed)", 0)
-    if record.first_message_at is None:
-        return Signal("First message", "none yet", 0)
-    elapsed = (_parse_ts(record.first_message_at) - _parse_ts(record.joined_at)).total_seconds()
-    if elapsed < 30:
-        weight, note = -2, "posted immediately"
-    else:
-        weight, note = 0, "posted later"
-    return Signal("First message", f"{fmt_duration(elapsed)} after join — {note}", weight)
+        return Signal("First message", "no record", 0)
+    if record.first_message_at is not None:
+        elapsed = (_parse_ts(record.first_message_at)
+                   - _parse_ts(record.joined_at)).total_seconds()
+        if elapsed < 30:
+            weight, note = -2, "**posted immediately**"
+        else:
+            weight, note = 0, "posted later"
+        return Signal("First message", f"{fmt_duration(elapsed)} after join — {note}", weight)
+
+    joined_ago = (datetime.now(timezone.utc) - _parse_ts(record.joined_at)).total_seconds()
+    if joined_ago > 24 * 3600:
+        return Signal("First message",
+                       "none observed (bot was down or member never posted)", 0)
+    return Signal("First message", "none yet", 0)
 
 
 _SIGNALS = [
