@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Union
 
 import discord
 from discord import app_commands
@@ -76,14 +76,14 @@ def _elapsed_since(iso_ts: str) -> float:
     return (datetime.now(timezone.utc) - datetime.fromisoformat(iso_ts)).total_seconds()
 
 
-async def _record_audit(member: discord.Member, result: Audit, kind: str) -> None:
+async def _record_audit(user_id: int, guild_id: int, result: Audit, kind: str) -> None:
     signals_data = [
         {"name": s.name, "detail": s.detail, "weight": s.weight}
         for s in result.signals
     ]
     await db.record_audit(
-        user_id=member.id,
-        guild_id=member.guild.id,
+        user_id=user_id,
+        guild_id=guild_id,
         kind=kind,
         score=result.score,
         band=result.band,
@@ -91,42 +91,78 @@ async def _record_audit(member: discord.Member, result: Audit, kind: str) -> Non
     )
 
 
-async def _post_to_mod_channel(guild_id: int, content: str,
-                                embed: Optional[discord.Embed] = None) -> None:
+async def _post_or_update_audit(
+    user_id: int,
+    guild_id: int,
+    embed: discord.Embed,
+) -> Optional[discord.Message]:
+    """Edit the member's existing mod-channel audit message with the new
+    embed. If it doesn't exist or the edit fails, post a fresh message
+    and remember its ID for future edits."""
+    record = await db.get_member_record(user_id, guild_id)
+    if (record is not None
+            and record.audit_channel_id is not None
+            and record.audit_message_id is not None):
+        channel = bot.get_channel(record.audit_channel_id)
+        if channel is not None:
+            try:
+                msg = await channel.fetch_message(record.audit_message_id)
+                await msg.edit(embed=embed)
+                return msg
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass  # fall through to fresh post
+
     mod_channel_id = GUILDS.get(guild_id)
     if mod_channel_id is None:
-        return
+        return None
     channel = bot.get_channel(mod_channel_id)
     if channel is None:
         log.warning("mod channel %s unresolved for guild %s", mod_channel_id, guild_id)
-        return
+        return None
     try:
-        await channel.send(content=content, embed=embed)
+        msg = await channel.send(embed=embed)
     except discord.Forbidden:
-        log.error("cannot post to mod channel: missing permission in #%s", channel.name)
+        log.error("cannot post audit: missing permission in #%s", channel.name)
+        return None
     except discord.HTTPException as e:
-        log.error("failed to post to mod channel: %s", e)
+        log.error("failed to post audit embed: %s", e)
+        return None
+
+    await db.set_audit_message(user_id, guild_id, mod_channel_id, msg.id)
+    return msg
 
 
-@bot.event
-async def setup_hook():
-    await db.init()
-    log.info("database initialised at %s", db.DB_PATH)
-    for guild_id in GUILDS:
-        guild = discord.Object(id=guild_id)
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        log.info("synced %d slash command(s) to guild %s", len(synced), guild_id)
+async def _post_notice(
+    guild_id: int,
+    content: str,
+    reply_to_message_id: Optional[int] = None,
+) -> Optional[discord.Message]:
+    """Post a plain-text notice to the guild's mod channel. If a message
+    ID is given, post it as a Discord reply so mods can click through to
+    the referenced audit embed."""
+    mod_channel_id = GUILDS.get(guild_id)
+    if mod_channel_id is None:
+        return None
+    channel = bot.get_channel(mod_channel_id)
+    if channel is None:
+        return None
+    reference = None
+    if reply_to_message_id is not None:
+        reference = discord.MessageReference(
+            message_id=reply_to_message_id,
+            channel_id=mod_channel_id,
+            fail_if_not_exists=False,
+        )
+    try:
+        return await channel.send(content=content, reference=reference)
+    except discord.Forbidden:
+        log.error("cannot post notice: missing permission in #%s", channel.name)
+    except discord.HTTPException as e:
+        log.error("failed to post notice: %s", e)
+    return None
 
 
 async def _bootstrap_members(guild: discord.Guild) -> None:
-    """Create a members row for each current guild member missing one.
-
-    Bot downtime means we miss on_member_join for anyone who arrived while
-    we were offline; without a bootstrap they'd have no behavioural
-    tracking data ever. We fill joined_at from Discord's canonical
-    member.joined_at; invite is unknown (we never observed the diff).
-    """
     created = 0
     for member in guild.members:
         if member.bot:
@@ -138,11 +174,22 @@ async def _bootstrap_members(guild: discord.Guild) -> None:
         await db.upsert_member_join(
             member.id, guild.id,
             joined.isoformat(timespec="seconds"),
-            None,
+            invite_code=None,
         )
         created += 1
     if created:
         log.info("bootstrapped %d member record(s) for guild %s", created, guild.id)
+
+
+@bot.event
+async def setup_hook():
+    await db.init()
+    log.info("database initialised at %s", db.DB_PATH)
+    for guild_id in GUILDS:
+        guild = discord.Object(id=guild_id)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        log.info("synced %d slash command(s) to guild %s", len(synced), guild_id)
 
 
 @bot.event
@@ -184,30 +231,29 @@ async def on_invite_delete(invite: discord.Invite):
 async def on_member_join(member: discord.Member):
     if member.bot:
         return
-    mod_channel_id = GUILDS.get(member.guild.id)
-    if mod_channel_id is None:
+    if member.guild.id not in GUILDS:
         return
 
     used_invite = await invites.find_used(member.guild)
     joined_at = (member.joined_at or datetime.now(timezone.utc)).isoformat(timespec="seconds")
     invite_code = used_invite.code if used_invite else None
-    await db.upsert_member_join(member.id, member.guild.id, joined_at, invite_code)
+    inviter_id = used_invite.inviter.id if used_invite and used_invite.inviter else None
+    inviter_name = used_invite.inviter.name if used_invite and used_invite.inviter else None
+    await db.upsert_member_join(
+        member.id, member.guild.id, joined_at,
+        invite_code=invite_code,
+        invite_inviter_id=inviter_id,
+        invite_inviter_name=inviter_name,
+    )
 
     result = await audit(member, bot, used_invite=used_invite)
-    await _record_audit(member, result, "join")
+    await _record_audit(member.id, member.guild.id, result, "join")
     log.info("member joined: %s (id=%s, guild=%s, score=%+d, band=%s, invite=%s)",
              member, member.id, member.guild.id, result.score, result.band,
              invite_code or "unknown")
 
     embed = build_audit_embed(member, result)
-    try:
-        channel = bot.get_channel(mod_channel_id)
-        if channel is not None:
-            await channel.send(embed=embed)
-    except discord.Forbidden:
-        log.error("cannot post audit: missing permission in mod channel")
-    except discord.HTTPException as e:
-        log.error("failed to post audit embed: %s", e)
+    await _post_or_update_audit(member.id, member.guild.id, embed)
 
 
 def _detect_onboarding_completed(before: discord.Member, after: discord.Member) -> bool:
@@ -246,12 +292,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             note = " — fast"
 
     result = await audit(after, bot)
-    await _record_audit(after, result, "onboarding")
+    await _record_audit(after.id, after.guild.id, result, "onboarding")
     embed = build_audit_embed(after, result)
-    await _post_to_mod_channel(
+    updated = await _post_or_update_audit(after.id, after.guild.id, embed)
+    await _post_notice(
         after.guild.id,
         f"{after.mention} completed onboarding in {elapsed_str}{note}",
-        embed=embed,
+        reply_to_message_id=updated.id if updated else None,
     )
 
 
@@ -268,11 +315,6 @@ async def on_message(message: discord.Message):
     record = await db.get_member_record(message.author.id, message.guild.id)
     if record is None or record.first_message_at is not None:
         return
-
-    # If they joined more than 24h ago and we still have no first_message_at,
-    # this cannot be their real first message — bot was down when it happened
-    # or the record was bootstrapped for an already-active member. Recording
-    # this message would lie about the timing.
     joined_ago = _elapsed_since(record.joined_at)
     if joined_ago > _FIRST_MSG_RECORD_WINDOW_SECONDS:
         return
@@ -296,20 +338,21 @@ async def on_message(message: discord.Message):
 
     member = message.guild.get_member(message.author.id) or await message.guild.fetch_member(message.author.id)
     result = await audit(member, bot)
-    await _record_audit(member, result, "first_message")
+    await _record_audit(member.id, member.guild.id, result, "first_message")
     embed = build_audit_embed(member, result)
-    await _post_to_mod_channel(
+    updated = await _post_or_update_audit(member.id, member.guild.id, embed)
+    await _post_notice(
         message.guild.id,
         f"{message.author.mention} first message in {message.channel.mention}, "
         f"{fmt_duration(elapsed)} after join{note}\n> {preview}",
-        embed=embed,
+        reply_to_message_id=updated.id if updated else None,
     )
 
 
 async def _reply_with_audit(interaction: discord.Interaction, member: discord.Member) -> None:
     await interaction.response.defer(ephemeral=True)
     result = await audit(member, bot)
-    await _record_audit(member, result, "manual")
+    await _record_audit(member.id, member.guild.id, result, "manual")
     embed = build_audit_embed(member, result)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -372,18 +415,7 @@ async def audit_id_command(interaction: discord.Interaction, user_id: str) -> No
         )
         return
 
-    signals_data = [
-        {"name": s.name, "detail": s.detail, "weight": s.weight}
-        for s in result.signals
-    ]
-    await db.record_audit(
-        user_id=parsed_id,
-        guild_id=interaction.guild.id,
-        kind="manual-id",
-        score=result.score,
-        band=result.band,
-        signals_json=json.dumps(signals_data),
-    )
+    await _record_audit(parsed_id, interaction.guild.id, result, "manual-id")
     embed = build_audit_embed(user, result)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -413,14 +445,19 @@ async def flag_command(
         reason=reason_text,
     )
     result = await audit(member, bot)
-    await _record_audit(member, result, "flag")
+    await _record_audit(member.id, member.guild.id, result, "flag")
     embed = build_audit_embed(member, result)
+    updated = await _post_or_update_audit(member.id, member.guild.id, embed)
 
     log_content = (
-        f"**{interaction.user.mention}** flagged **{member.mention}**"
+        f"{interaction.user.mention} flagged {member.mention}"
         + (f" — {reason_text}" if reason_text else "")
     )
-    await _post_to_mod_channel(interaction.guild.id, log_content, embed=embed)
+    await _post_notice(
+        interaction.guild.id,
+        log_content,
+        reply_to_message_id=updated.id if updated else None,
+    )
 
     await interaction.followup.send(
         f"Added **{member}** to the blocklist.",
@@ -448,11 +485,16 @@ async def unflag_command(
             ephemeral=True,
         )
         return
-    log_content = (
-        f"**{interaction.user.mention}** removed **{member.mention}** "
-        f"from the blocklist ({n} flag(s) deactivated)."
+    result = await audit(member, bot)
+    await _record_audit(member.id, member.guild.id, result, "unflag")
+    embed = build_audit_embed(member, result)
+    updated = await _post_or_update_audit(member.id, member.guild.id, embed)
+    await _post_notice(
+        interaction.guild.id,
+        f"{interaction.user.mention} removed {member.mention} from the blocklist "
+        f"({n} flag(s) deactivated).",
+        reply_to_message_id=updated.id if updated else None,
     )
-    await _post_to_mod_channel(interaction.guild.id, log_content)
     await interaction.followup.send(
         f"Removed **{member}** from the blocklist.",
         ephemeral=True,

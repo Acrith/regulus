@@ -87,20 +87,38 @@ def _signal_blocklist(ctx: AuditContext) -> Signal:
 
 def _signal_invite(ctx: AuditContext) -> Signal:
     inv = ctx.used_invite
-    if inv is None:
-        return Signal("Invite", "unknown (vanity URL, cold cache, or retroactive audit)",
-                       0, prominent=True)
-    creator = inv.inviter
-    if creator is None:
-        creator_str = "unknown"
-    else:
-        creator_str = f"{creator.mention} (@{creator.name})"
-    return Signal(
-        "Invite",
-        f"`{inv.code}` — by {creator_str}, {inv.uses} uses",
-        0,
-        prominent=True,
-    )
+    if inv is not None:
+        creator = inv.inviter
+        if creator is None:
+            creator_str = "unknown"
+        else:
+            creator_str = f"{creator.mention} (@{creator.name})"
+        return Signal(
+            "Invite",
+            f"`{inv.code}` — by {creator_str}, {inv.uses} uses",
+            0,
+            prominent=True,
+        )
+
+    # Fallback: reconstruct from the member record persisted at join.
+    record = ctx.member_record
+    if record and record.invite_code:
+        if record.invite_inviter_id:
+            creator_str = (
+                f"<@{record.invite_inviter_id}> "
+                f"(@{record.invite_inviter_name or 'unknown'})"
+            )
+        else:
+            creator_str = "unknown"
+        return Signal(
+            "Invite",
+            f"`{record.invite_code}` — by {creator_str} (persisted at join)",
+            0,
+            prominent=True,
+        )
+
+    return Signal("Invite", "unknown (vanity URL, cold cache, or retroactive audit)",
+                   0, prominent=True)
 
 
 def _signal_mutual_servers(ctx: AuditContext) -> Signal:

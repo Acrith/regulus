@@ -47,10 +47,23 @@ CREATE TABLE IF NOT EXISTS members (
     onboarding_completed_at TEXT,
     first_message_at        TEXT,
     invite_code             TEXT,
+    invite_inviter_id       INTEGER,
+    invite_inviter_name     TEXT,
+    audit_channel_id        INTEGER,
+    audit_message_id        INTEGER,
     PRIMARY KEY (user_id, guild_id)
 );
 CREATE INDEX IF NOT EXISTS idx_members_guild ON members(guild_id);
 """
+
+# Additive column migrations for existing databases.
+# Each entry: (table, column, sql-type).
+_MIGRATIONS = [
+    ("members", "invite_inviter_id",   "INTEGER"),
+    ("members", "invite_inviter_name", "TEXT"),
+    ("members", "audit_channel_id",    "INTEGER"),
+    ("members", "audit_message_id",    "INTEGER"),
+]
 
 
 @dataclass
@@ -70,9 +83,31 @@ class MemberRecord:
     onboarding_completed_at: Optional[str]
     first_message_at: Optional[str]
     invite_code: Optional[str]
+    invite_inviter_id: Optional[int] = None
+    invite_inviter_name: Optional[str] = None
+    audit_channel_id: Optional[int] = None
+    audit_message_id: Optional[int] = None
 
 
 _conn: Optional[aiosqlite.Connection] = None
+
+
+async def _existing_columns(table: str) -> set[str]:
+    assert _conn is not None
+    async with _conn.execute(f"PRAGMA table_info({table})") as cursor:
+        rows = await cursor.fetchall()
+    return {row[1] for row in rows}
+
+
+async def _run_migrations() -> None:
+    """Apply additive column migrations idempotently."""
+    assert _conn is not None
+    for table, column, spec in _MIGRATIONS:
+        cols = await _existing_columns(table)
+        if column in cols:
+            continue
+        await _conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
+    await _conn.commit()
 
 
 async def init() -> None:
@@ -80,6 +115,7 @@ async def init() -> None:
     _conn = await aiosqlite.connect(DB_PATH)
     await _conn.executescript(_SCHEMA)
     await _conn.commit()
+    await _run_migrations()
 
 
 async def close() -> None:
@@ -147,20 +183,34 @@ async def record_audit(user_id: int, guild_id: int, kind: str,
 
 # ---- member records ----
 
-async def upsert_member_join(user_id: int, guild_id: int, joined_at: str,
-                              invite_code: Optional[str]) -> None:
-    """Record a fresh join. On rejoin, resets onboarding and first-message
-    timestamps so behavioural tracking reflects the new session."""
+async def upsert_member_join(
+    user_id: int,
+    guild_id: int,
+    joined_at: str,
+    invite_code: Optional[str],
+    invite_inviter_id: Optional[int] = None,
+    invite_inviter_name: Optional[str] = None,
+) -> None:
+    """Record a fresh join. On rejoin, resets onboarding, first-message,
+    and audit-message references so behavioural tracking and the audit
+    embed reflect the new session."""
     assert _conn is not None, "db.init() must be called before use"
     await _conn.execute(
-        "INSERT INTO members (user_id, guild_id, joined_at, invite_code) "
-        "VALUES (?, ?, ?, ?) "
+        "INSERT INTO members ("
+        "  user_id, guild_id, joined_at, invite_code,"
+        "  invite_inviter_id, invite_inviter_name"
+        ") VALUES (?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(user_id, guild_id) DO UPDATE SET "
         "  joined_at = excluded.joined_at, "
         "  invite_code = excluded.invite_code, "
+        "  invite_inviter_id = excluded.invite_inviter_id, "
+        "  invite_inviter_name = excluded.invite_inviter_name, "
         "  onboarding_completed_at = NULL, "
-        "  first_message_at = NULL",
-        (user_id, guild_id, joined_at, invite_code),
+        "  first_message_at = NULL, "
+        "  audit_channel_id = NULL, "
+        "  audit_message_id = NULL",
+        (user_id, guild_id, joined_at, invite_code,
+         invite_inviter_id, invite_inviter_name),
     )
     await _conn.commit()
 
@@ -193,11 +243,25 @@ async def set_first_message(user_id: int, guild_id: int,
     return cursor.rowcount > 0
 
 
+async def set_audit_message(user_id: int, guild_id: int,
+                             channel_id: int, message_id: int) -> None:
+    """Remember which mod-channel message holds this member's audit
+    embed, so subsequent events can edit it in place."""
+    assert _conn is not None, "db.init() must be called before use"
+    await _conn.execute(
+        "UPDATE members SET audit_channel_id = ?, audit_message_id = ? "
+        "WHERE user_id = ? AND guild_id = ?",
+        (channel_id, message_id, user_id, guild_id),
+    )
+    await _conn.commit()
+
+
 async def get_member_record(user_id: int, guild_id: int) -> Optional[MemberRecord]:
     assert _conn is not None, "db.init() must be called before use"
     async with _conn.execute(
         "SELECT user_id, guild_id, joined_at, onboarding_completed_at, "
-        "first_message_at, invite_code "
+        "first_message_at, invite_code, invite_inviter_id, "
+        "invite_inviter_name, audit_channel_id, audit_message_id "
         "FROM members WHERE user_id = ? AND guild_id = ?",
         (user_id, guild_id),
     ) as cursor:
@@ -207,5 +271,7 @@ async def get_member_record(user_id: int, guild_id: int) -> Optional[MemberRecor
     return MemberRecord(
         user_id=row[0], guild_id=row[1], joined_at=row[2],
         onboarding_completed_at=row[3], first_message_at=row[4],
-        invite_code=row[5],
+        invite_code=row[5], invite_inviter_id=row[6],
+        invite_inviter_name=row[7], audit_channel_id=row[8],
+        audit_message_id=row[9],
     )

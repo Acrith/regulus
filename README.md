@@ -95,10 +95,11 @@ When a member joins a **configured** server, the bot:
 4. Computes a trust score from all signals and picks a band. Behavioural signals (onboarding speed, first-message timing) read `pending` / `none yet` at this point.
 5. Logs to console and posts an audit embed to the guild's configured mod channel.
 
-Then, as behaviour unfolds:
+Then, as behaviour unfolds, the bot **edits the original audit embed in place** (via the persisted `audit_message_id`) so a member has exactly one embed in the mod channel that always reflects their latest state. A small text notice is posted as a Discord **reply** to that embed, so mods see the delta plus a clickable jump to the current audit:
 
-- **Onboarding completed** (either Rules Screening's `pending` transition or the `COMPLETED_ONBOARDING` member flag) → `onboarding_completed_at` is set; a small notice plus an **updated** audit embed lands in the mod channel with the elapsed duration and a `**speedrun**` / `fast` marker for suspicious times.
-- **First message sent** → `first_message_at` is set; a notice with the message preview (and any attachment/embed count) plus an updated audit embed lands in the mod channel. A first message within 30 seconds of join is flagged `**immediately after join**`.
+- **Onboarding completed** (either Rules Screening's `pending` transition or the `COMPLETED_ONBOARDING` member flag) → `onboarding_completed_at` is set; embed updated; notice: `<user> completed onboarding in <duration>` with a `**speedrun**` / `fast` marker for suspicious times.
+- **First message sent** → `first_message_at` is set; embed updated; notice: `<user> first message in <channel>, <duration> after join` with the message preview (attachment or embed count if no text). A first message within 30 seconds of join is flagged `**immediately after join**`.
+- **`/flag` and `/unflag`** also edit the same embed and reply-notice, so the mod channel history stays clean and the "current picture" is always where you left off scrolling.
 
 Bands, from highest score to lowest: `Trusted`, `Likely-safe`, `Neutral`, `Suspicious`, `Malicious`. Thresholds are defined in `scoring.py` and are the initial guess — expect to tune them.
 
