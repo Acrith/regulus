@@ -10,6 +10,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import db
+import enforcement
 import invites
 from embeds import build_audit_embed
 from scoring import Audit, audit, audit_by_user_id, fmt_duration
@@ -208,6 +209,11 @@ async def on_ready():
                 log.info("    mod channel: #%s (id=%s)", channel.name, channel.id)
             await invites.refresh(guild)
             await _bootstrap_members(guild)
+            config = await db.get_guild_config(guild.id)
+            log.info("    enforcement: mode=%s hold_below=%s malicious=%s role_id=%s",
+                     config.mode, config.hold_below_band,
+                     config.malicious_action,
+                     config.unverified_role_id or "unset")
 
 
 @bot.event
@@ -499,6 +505,313 @@ async def unflag_command(
         f"Removed **{member}** from the blocklist.",
         ephemeral=True,
     )
+
+
+_UNVERIFIED_DENY_KEYS = (
+    "send_messages", "send_messages_in_threads",
+    "create_public_threads", "create_private_threads",
+    "add_reactions", "attach_files", "embed_links",
+    "mention_everyone", "use_application_commands",
+)
+
+
+def _make_unverified_overwrite(can_view: bool, is_voice: bool) -> discord.PermissionOverwrite:
+    overwrite = discord.PermissionOverwrite()
+    overwrite.view_channel = can_view
+    for perm in _UNVERIFIED_DENY_KEYS:
+        setattr(overwrite, perm, False)
+    if is_voice:
+        overwrite.speak = False
+        overwrite.stream = False
+        overwrite.connect = False if not can_view else None
+    return overwrite
+
+
+@bot.tree.command(
+    name="setup-unverified",
+    description="Create the @Unverified role and apply deny overrides guild-wide.",
+)
+@app_commands.describe(
+    role_name="Name for the role (default: Unverified)",
+    open_channels="Comma-separated channel names Unverified can still view (e.g. 'welcome,rules')",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setup_unverified_command(
+    interaction: discord.Interaction,
+    role_name: str = "Unverified",
+    open_channels: str = "",
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    me = guild.me
+
+    if not me.guild_permissions.manage_roles:
+        await interaction.followup.send(
+            "I need the **Manage Roles** permission to run this. Please grant it and re-run.",
+            ephemeral=True,
+        )
+        return
+    if not me.guild_permissions.manage_channels:
+        await interaction.followup.send(
+            "I need the **Manage Channels** permission to run this. Please grant it and re-run.",
+            ephemeral=True,
+        )
+        return
+
+    open_names = {
+        n.strip().lower().lstrip("#")
+        for n in open_channels.split(",") if n.strip()
+    }
+
+    role = discord.utils.get(guild.roles, name=role_name)
+    created = False
+    if role is None:
+        try:
+            role = await guild.create_role(
+                name=role_name,
+                color=discord.Color.from_rgb(180, 90, 90),
+                hoist=False,
+                mentionable=False,
+                reason=f"Regulus /setup-unverified by {interaction.user}",
+            )
+            created = True
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Failed to create the role — I don't have permission.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                f"Failed to create the role: `{e}`",
+                ephemeral=True,
+            )
+            return
+
+    bot_top_role = me.top_role
+    target_position = bot_top_role.position - 1
+    if target_position > 0 and role.position != target_position:
+        try:
+            await role.edit(
+                position=target_position,
+                reason="Regulus: position Unverified below the bot's role",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    updated = 0
+    opened_names: list[str] = []
+    skipped: list[str] = []
+    for channel in guild.channels:
+        can_view = channel.name.lower() in open_names
+        is_voice = isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+        overwrite = _make_unverified_overwrite(can_view=can_view, is_voice=is_voice)
+        try:
+            await channel.set_permissions(
+                role, overwrite=overwrite,
+                reason=f"Regulus /setup-unverified by {interaction.user}",
+            )
+            updated += 1
+            if can_view:
+                opened_names.append(channel.name)
+        except discord.Forbidden:
+            skipped.append(f"#{channel.name} (missing permission)")
+        except discord.HTTPException as e:
+            skipped.append(f"#{channel.name} ({e})")
+
+    await db.update_guild_config(
+        guild.id,
+        updated_by=interaction.user.id,
+        unverified_role_id=role.id,
+    )
+
+    lines = [
+        f"**@{role.name}** {'created' if created else 'updated'} — role ID `{role.id}`",
+        f"Applied deny overrides to **{updated}** channel(s).",
+    ]
+    if opened_names:
+        lines.append("Left viewable: " + ", ".join(f"#{n}" for n in opened_names))
+    if skipped:
+        lines.append(f"Skipped **{len(skipped)}** channel(s):")
+        for s in skipped[:10]:
+            lines.append(f"  • {s}")
+        if len(skipped) > 10:
+            lines.append(f"  • …and {len(skipped) - 10} more")
+    lines.append("")
+    lines.append(
+        "Enforcement is **not yet active**. Run "
+        "`/enforcement mode new_mode:active` when you are ready to hold "
+        "low-band joiners and act on Malicious ones."
+    )
+    lines.append(
+        "If you add new channels later, re-run this command to apply "
+        "the overrides — the bot does not yet auto-provision new channels."
+    )
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+enforcement_group = app_commands.Group(
+    name="enforcement",
+    description="Configure Regulus enforcement settings for this guild.",
+    default_permissions=discord.Permissions(moderate_members=True),
+    guild_only=True,
+)
+
+
+def _band_index_for_hold(band: str) -> int:
+    return enforcement.BAND_ORDER.index(band)
+
+
+def _describe_hold_effect(hold_below_band: str) -> str:
+    hold_idx = _band_index_for_hold(hold_below_band)
+    held = [b for i, b in enumerate(enforcement.BAND_ORDER) if i > hold_idx and b != "Malicious"]
+    if not held:
+        return "no bands would be held (only Malicious is acted on)"
+    return "would hold: " + ", ".join(held)
+
+
+async def _notify_enforcement_change(guild_id: int, actor_id: int, change: str) -> None:
+    await _post_notice(guild_id, f"<@{actor_id}> updated enforcement: {change}")
+
+
+@enforcement_group.command(
+    name="show",
+    description="Show the current enforcement configuration for this guild.",
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def enforcement_show(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    config = await db.get_guild_config(interaction.guild.id)
+    role_line = "unset — run `/setup-unverified` first"
+    if config.unverified_role_id:
+        role_obj = interaction.guild.get_role(config.unverified_role_id)
+        role_line = (
+            role_obj.mention if role_obj
+            else f"`{config.unverified_role_id}` (role missing?)"
+        )
+    lines = [
+        f"**Mode:** `{config.mode}`  "
+        + ("(**not enforcing** — audits only)" if config.mode == "shadow"
+           else "(**enforcing** join actions)"),
+        f"**Hold threshold:** below `{config.hold_below_band}` — "
+        f"{_describe_hold_effect(config.hold_below_band)}",
+        f"**Malicious action:** `{config.malicious_action}`",
+        f"**Unverified role:** {role_line}",
+        f"**Last updated:** `{config.updated_at}`"
+        + (f" by <@{config.updated_by}>" if config.updated_by else ""),
+        "",
+        "_Note: even in `active` mode, enforcement dispatch on member join_",
+        "_is not yet wired in — this will land in a subsequent commit._",
+    ]
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@enforcement_group.command(
+    name="mode",
+    description="Set enforcement mode.",
+)
+@app_commands.describe(new_mode="shadow = observe only. active = act on join.")
+@app_commands.choices(new_mode=[
+    app_commands.Choice(name="shadow (audit only, no enforcement)", value="shadow"),
+    app_commands.Choice(name="active (assign Unverified + act on Malicious)", value="active"),
+])
+@app_commands.checks.has_permissions(moderate_members=True)
+async def enforcement_mode_command(
+    interaction: discord.Interaction,
+    new_mode: app_commands.Choice[str],
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    config = await db.get_guild_config(interaction.guild.id)
+    if new_mode.value == "active" and config.unverified_role_id is None:
+        await interaction.followup.send(
+            "Cannot enable `active` mode: run `/setup-unverified` first so "
+            "an Unverified role exists to assign.",
+            ephemeral=True,
+        )
+        return
+    await db.update_guild_config(
+        interaction.guild.id,
+        updated_by=interaction.user.id,
+        mode=new_mode.value,
+    )
+    await _notify_enforcement_change(
+        interaction.guild.id, interaction.user.id,
+        f"mode → `{new_mode.value}`",
+    )
+    await interaction.followup.send(
+        f"Enforcement mode set to `{new_mode.value}`.",
+        ephemeral=True,
+    )
+
+
+@enforcement_group.command(
+    name="hold_below",
+    description="Hold joiners scoring worse than this band on the Unverified role.",
+)
+@app_commands.describe(band="Bands strictly worse than this get held on @Unverified.")
+@app_commands.choices(band=[
+    app_commands.Choice(name="Trusted (hold everyone below Trusted — strict)", value="Trusted"),
+    app_commands.Choice(name="Likely-safe (hold Neutral / Suspicious — default)", value="Likely-safe"),
+    app_commands.Choice(name="Neutral (hold only Suspicious — lenient)", value="Neutral"),
+    app_commands.Choice(name="Suspicious (hold no one — very lenient)", value="Suspicious"),
+])
+@app_commands.checks.has_permissions(moderate_members=True)
+async def enforcement_hold_below(
+    interaction: discord.Interaction,
+    band: app_commands.Choice[str],
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    await db.update_guild_config(
+        interaction.guild.id,
+        updated_by=interaction.user.id,
+        hold_below_band=band.value,
+    )
+    await _notify_enforcement_change(
+        interaction.guild.id, interaction.user.id,
+        f"hold threshold → below `{band.value}` — "
+        f"{_describe_hold_effect(band.value)}",
+    )
+    await interaction.followup.send(
+        f"Hold threshold set to `{band.value}` — "
+        f"{_describe_hold_effect(band.value)}.",
+        ephemeral=True,
+    )
+
+
+@enforcement_group.command(
+    name="malicious",
+    description="What to do with joiners in the Malicious band.",
+)
+@app_commands.describe(action="kick = remove but rejoinable. ban = permanent. hold = assign @Unverified.")
+@app_commands.choices(action=[
+    app_commands.Choice(name="kick (default — rejoinable)", value="kick"),
+    app_commands.Choice(name="ban (permanent, delete 1 day of messages)", value="ban"),
+    app_commands.Choice(name="hold (assign @Unverified — mod reviews)", value="hold"),
+])
+@app_commands.checks.has_permissions(moderate_members=True)
+async def enforcement_malicious(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    await db.update_guild_config(
+        interaction.guild.id,
+        updated_by=interaction.user.id,
+        malicious_action=action.value,
+    )
+    await _notify_enforcement_change(
+        interaction.guild.id, interaction.user.id,
+        f"malicious action → `{action.value}`",
+    )
+    await interaction.followup.send(
+        f"Malicious action set to `{action.value}`.",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(enforcement_group)
 
 
 @bot.tree.error

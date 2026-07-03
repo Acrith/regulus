@@ -54,6 +54,16 @@ CREATE TABLE IF NOT EXISTS members (
     PRIMARY KEY (user_id, guild_id)
 );
 CREATE INDEX IF NOT EXISTS idx_members_guild ON members(guild_id);
+
+CREATE TABLE IF NOT EXISTS guild_config (
+    guild_id           INTEGER PRIMARY KEY,
+    mode               TEXT    NOT NULL DEFAULT 'shadow',
+    unverified_role_id INTEGER,
+    hold_below_band    TEXT    NOT NULL DEFAULT 'Likely-safe',
+    malicious_action   TEXT    NOT NULL DEFAULT 'kick',
+    updated_at         TEXT    NOT NULL,
+    updated_by         INTEGER
+);
 """
 
 # Additive column migrations for existing databases.
@@ -73,6 +83,17 @@ class Flag:
     flagged_by: int
     reason: Optional[str]
     created_at: str
+
+
+@dataclass
+class GuildConfig:
+    guild_id: int
+    mode: str
+    unverified_role_id: Optional[int]
+    hold_below_band: str
+    malicious_action: str
+    updated_at: str
+    updated_by: Optional[int]
 
 
 @dataclass
@@ -255,6 +276,71 @@ async def set_audit_message(user_id: int, guild_id: int,
     )
     await _conn.commit()
 
+
+# ---- guild config ----
+
+async def get_guild_config(guild_id: int) -> GuildConfig:
+    """Return the guild's enforcement config, inserting defaults if missing."""
+    assert _conn is not None, "db.init() must be called before use"
+    async with _conn.execute(
+        "SELECT guild_id, mode, unverified_role_id, hold_below_band, "
+        "malicious_action, updated_at, updated_by "
+        "FROM guild_config WHERE guild_id = ?",
+        (guild_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is not None:
+        return GuildConfig(*row)
+    now = _now()
+    await _conn.execute(
+        "INSERT INTO guild_config (guild_id, updated_at) VALUES (?, ?)",
+        (guild_id, now),
+    )
+    await _conn.commit()
+    return GuildConfig(
+        guild_id=guild_id, mode="shadow", unverified_role_id=None,
+        hold_below_band="Likely-safe", malicious_action="kick",
+        updated_at=now, updated_by=None,
+    )
+
+
+async def update_guild_config(
+    guild_id: int,
+    updated_by: Optional[int],
+    mode: Optional[str] = None,
+    unverified_role_id: Optional[int] = None,
+    hold_below_band: Optional[str] = None,
+    malicious_action: Optional[str] = None,
+) -> None:
+    """Update one or more config fields. Only non-None args are written."""
+    assert _conn is not None, "db.init() must be called before use"
+    await get_guild_config(guild_id)  # ensure row exists
+
+    updates: list[tuple[str, object]] = []
+    if mode is not None:
+        updates.append(("mode", mode))
+    if unverified_role_id is not None:
+        updates.append(("unverified_role_id", unverified_role_id))
+    if hold_below_band is not None:
+        updates.append(("hold_below_band", hold_below_band))
+    if malicious_action is not None:
+        updates.append(("malicious_action", malicious_action))
+    if not updates:
+        return
+
+    updates.append(("updated_at", _now()))
+    updates.append(("updated_by", updated_by))
+
+    set_clause = ", ".join(f"{col} = ?" for col, _ in updates)
+    values = [v for _, v in updates] + [guild_id]
+    await _conn.execute(
+        f"UPDATE guild_config SET {set_clause} WHERE guild_id = ?",
+        values,
+    )
+    await _conn.commit()
+
+
+# ---- member records ----
 
 async def get_member_record(user_id: int, guild_id: int) -> Optional[MemberRecord]:
     assert _conn is not None, "db.init() must be called before use"
