@@ -34,6 +34,7 @@ class AuditContext:
     used_invite: Optional[discord.Invite] = None
     total_bot_guilds: int = 1
     member_record: Optional[db.MemberRecord] = None
+    client: Optional[discord.Client] = None
 
 
 @dataclass
@@ -71,9 +72,14 @@ def _signal_blocklist(ctx: AuditContext) -> Signal:
         return Signal("Blocklist", "clean", 0)
     date = flag.created_at[:10]
     reason = flag.reason or "no reason given"
-    detail = f"flagged {date}: {reason}"
-    if len(detail) > 100:
-        detail = detail[:97] + "..."
+    guild = ctx.client.get_guild(flag.guild_id) if ctx.client else None
+    guild_str = f"**{guild.name}**" if guild else f"guild `{flag.guild_id}`"
+    detail = (
+        f"by <@{flag.flagged_by}> in {guild_str} on {date}\n"
+        f"Reason: {reason}"
+    )
+    if len(detail) > 400:
+        detail = detail[:397] + "..."
     return Signal("Blocklist", detail, -10, prominent=True)
 
 
@@ -268,6 +274,7 @@ async def audit(
         used_invite=used_invite,
         total_bot_guilds=len(client.guilds),
         member_record=member_record,
+        client=client,
     )
     signals = [fn(ctx) for fn in _SIGNALS]
     score = sum(s.weight for s in signals)
