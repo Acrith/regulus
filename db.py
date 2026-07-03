@@ -152,19 +152,21 @@ def _now() -> str:
 
 # ---- flags ----
 
-async def get_active_flag(user_id: int) -> Optional[Flag]:
+async def get_active_flags(user_id: int) -> list[Flag]:
+    """Return every active flag for a user, most recent first, across all guilds."""
     assert _conn is not None, "db.init() must be called before use"
     async with _conn.execute(
         "SELECT user_id, guild_id, flagged_by, reason, created_at "
         "FROM flags WHERE user_id = ? AND active = 1 "
-        "ORDER BY created_at DESC LIMIT 1",
+        "ORDER BY created_at DESC",
         (user_id,),
     ) as cursor:
-        row = await cursor.fetchone()
-    if row is None:
-        return None
-    return Flag(user_id=row[0], guild_id=row[1], flagged_by=row[2],
-                reason=row[3], created_at=row[4])
+        rows = await cursor.fetchall()
+    return [
+        Flag(user_id=r[0], guild_id=r[1], flagged_by=r[2],
+             reason=r[3], created_at=r[4])
+        for r in rows
+    ]
 
 
 async def add_flag(user_id: int, guild_id: int, flagged_by: int,

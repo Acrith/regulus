@@ -7,7 +7,7 @@ score maps to a band. Bands are informational in shadow mode.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Union
 
@@ -32,7 +32,7 @@ class AuditContext:
     guild_id: int
     member: Optional[discord.Member] = None  # None if user is not a current member of guild_id
     full_user: Optional[discord.User] = None
-    active_flag: Optional[db.Flag] = None
+    active_flags: list[db.Flag] = field(default_factory=list)
     used_invite: Optional[discord.Invite] = None
     total_bot_guilds: int = 1
     member_record: Optional[db.MemberRecord] = None
@@ -69,20 +69,34 @@ def _parse_ts(ts: str) -> datetime:
 
 
 def _signal_blocklist(ctx: AuditContext) -> Signal:
-    flag = ctx.active_flag
-    if flag is None:
+    flags = ctx.active_flags
+    if not flags:
         return Signal("Not on blocklist", "​", 0, prominent=True)
-    date = flag.created_at[:10]
-    reason = flag.reason or "no reason given"
-    guild = ctx.client.get_guild(flag.guild_id) if ctx.client else None
-    guild_str = f"**{guild.name}**" if guild else f"guild `{flag.guild_id}`"
-    detail = (
-        f"by <@{flag.flagged_by}> in {guild_str} on {date}\n"
-        f"Reason: {reason}"
+
+    n = len(flags)
+    header = (
+        f"Blocklist  ({n} flag across bot's servers)"
+        if n == 1 else
+        f"Blocklist  ({n} flags across bot's servers)"
     )
-    if len(detail) > 400:
-        detail = detail[:397] + "..."
-    return Signal("Blocklist", detail, -10, prominent=True)
+
+    lines: list[str] = []
+    for flag in flags[:5]:
+        date = flag.created_at[:10]
+        guild = ctx.client.get_guild(flag.guild_id) if ctx.client else None
+        guild_str = f"**{guild.name}**" if guild else f"guild `{flag.guild_id}`"
+        reason = flag.reason or "no reason given"
+        lines.append(
+            f"• {guild_str} — by <@{flag.flagged_by}> on {date}\n"
+            f"  Reason: {reason}"
+        )
+    if n > 5:
+        lines.append(f"…and {n - 5} more")
+
+    detail = "\n".join(lines)
+    if len(detail) > 900:
+        detail = detail[:897] + "..."
+    return Signal(header, detail, -10, prominent=True)
 
 
 def _signal_invite(ctx: AuditContext) -> Signal:
@@ -147,6 +161,35 @@ def _signal_account_age(ctx: AuditContext) -> Signal:
     else:
         weight = 2
     return Signal("Account age", _fmt_age(age_days), weight)
+
+
+def _signal_server_tenure(ctx: AuditContext) -> Signal:
+    """How long they've been a member of this specific guild.
+
+    Reads members.joined_at when available (accurate for bootstrap and
+    fresh joins), falls back to member.joined_at from Discord. Returns
+    'unknown' when the subject is not a current member (e.g. /audit-id
+    on a banned user)."""
+    record = ctx.member_record
+    joined_iso: Optional[str] = None
+    if record is not None:
+        joined_iso = record.joined_at
+    elif ctx.member is not None and ctx.member.joined_at is not None:
+        joined_iso = ctx.member.joined_at.isoformat(timespec="seconds")
+
+    if joined_iso is None:
+        return Signal("Server tenure", "unknown (not in current guild)", 0)
+
+    tenure_days = (datetime.now(timezone.utc) - _parse_ts(joined_iso)).days
+    if tenure_days < 30:
+        weight = 0
+    elif tenure_days < 180:
+        weight = 1
+    elif tenure_days < 365:
+        weight = 2
+    else:
+        weight = 3
+    return Signal("Server tenure", f"{_fmt_age(tenure_days)} in server", weight)
 
 
 def _signal_avatar(ctx: AuditContext) -> Signal:
@@ -259,6 +302,7 @@ _SIGNALS = [
     _signal_invite,
     _signal_mutual_servers,
     _signal_account_age,
+    _signal_server_tenure,
     _signal_avatar,
     _signal_banner,
     _signal_avatar_decoration,
@@ -296,14 +340,14 @@ async def _build_context(
     used_invite: Optional[discord.Invite],
     client: discord.Client,
 ) -> AuditContext:
-    active_flag = await db.get_active_flag(user.id)
+    active_flags = await db.get_active_flags(user.id)
     member_record = await db.get_member_record(user.id, guild_id)
     return AuditContext(
         user=user,
         guild_id=guild_id,
         member=member,
         full_user=full_user,
-        active_flag=active_flag,
+        active_flags=active_flags,
         used_invite=used_invite,
         total_bot_guilds=len(client.guilds),
         member_record=member_record,

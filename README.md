@@ -224,6 +224,15 @@ Any button click also refuses users who lack `Moderate Members` in the guild, so
 
 Rows are created lazily when a guild is first read via `get_guild_config`. Every change made via `/enforcement` posts a notice to the guild's mod channel with the actor and the change, providing an audit trail.
 
+### Native-ban mirroring
+
+Regulus listens to `on_member_ban`. When a moderator bans a user via Discord's native right-click UI (rather than via Regulus's own enforcement path), the bot peeks the audit log to identify the actor and reason, then:
+
+- Adds a `flags` row with `reason: "native ban: <mod's reason>"` and the mod as `flagged_by`.
+- Posts a plain-text notice to the mod channel so the record is human-visible too.
+
+If Regulus itself performed the ban (via `active` mode or the `[Ban]` button on an alert), the listener recognises its own user ID in the audit log and skips — no double-flag. Requires the bot to have `View Audit Log` permission; if absent, the listener logs a warning and doesn't crash.
+
 ### For inspecting operators
 
 The set of actions the bot can take is bounded strictly by:

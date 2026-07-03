@@ -347,6 +347,51 @@ async def on_invite_delete(invite: discord.Invite):
 
 
 @bot.event
+async def on_member_ban(guild: discord.Guild, user: Union[discord.User, discord.Member]):
+    """When any mod (not the bot) bans a user via Discord's native UI, mirror
+    that into the blocklist so the intel survives and later audits see it."""
+    if guild.id not in GUILDS:
+        return
+
+    actor_id: Optional[int] = None
+    reason: Optional[str] = None
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=5):
+            if entry.target is not None and entry.target.id == user.id:
+                actor_id = entry.user.id if entry.user is not None else None
+                reason = entry.reason
+                break
+    except discord.Forbidden:
+        log.warning("cannot peek audit log for ban in guild %s (need View Audit Log)",
+                    guild.id)
+        return
+    except discord.HTTPException as e:
+        log.warning("audit log fetch failed for guild %s: %s", guild.id, e)
+        return
+
+    if actor_id is None:
+        return  # ban with no traceable audit-log entry
+    if bot.user is not None and actor_id == bot.user.id:
+        return  # our own ban path already flagged
+
+    reason_text = (reason or "native Discord ban").strip()
+    if len(reason_text) > 180:
+        reason_text = reason_text[:177] + "..."
+
+    await db.add_flag(
+        user_id=user.id,
+        guild_id=guild.id,
+        flagged_by=actor_id,
+        reason=f"native ban: {reason_text}",
+    )
+    await _post_notice(
+        guild.id,
+        f"<@{actor_id}> banned <@{user.id}> (`{user.id}`) via Discord — "
+        f"auto-added to blocklist.\nReason: {reason_text}",
+    )
+
+
+@bot.event
 async def on_member_join(member: discord.Member):
     if member.bot:
         return
