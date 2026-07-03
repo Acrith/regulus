@@ -585,6 +585,51 @@ async def audit_id_command(interaction: discord.Interaction, user_id: str) -> No
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+async def _dispatch_cross_guild_alerts(
+    user_id: int,
+    flagged_by_id: int,
+    reason: Optional[str],
+    originating_guild_id: int,
+) -> int:
+    """Post a threat-alert notice with local action buttons in every guild
+    where (a) the user is currently a member, (b) enforcement is active,
+    and (c) the guild is not the one where the flag originated. Returns
+    the count of alerts posted."""
+    originating_guild = bot.get_guild(originating_guild_id)
+    origin_name = (
+        originating_guild.name if originating_guild is not None
+        else f"guild `{originating_guild_id}`"
+    )
+    reason_line = f" — reason: *{reason}*" if reason else ""
+    posted = 0
+
+    for guild in bot.guilds:
+        if guild.id not in GUILDS:
+            continue
+        if guild.id == originating_guild_id:
+            continue
+        member = guild.get_member(user_id)
+        if member is None:
+            continue
+        config = await db.get_guild_config(guild.id)
+        if config.mode != "active":
+            continue
+
+        content = (
+            f"**Cross-server threat alert**\n"
+            f"<@{user_id}> (`{user_id}`) was just flagged in **{origin_name}** "
+            f"by <@{flagged_by_id}>{reason_line}.\n"
+            f"They are currently a member of this server. "
+            f"Run `/audit member:<@{user_id}>` for local context.\n"
+            f"Choose:"
+        )
+        view = enforcement.cross_guild_alert_view(user_id, guild.id)
+        result = await _post_notice(guild.id, content, view=view)
+        if result is not None:
+            posted += 1
+    return posted
+
+
 @bot.tree.command(
     name="flag",
     description="Add a user to the blocklist. Future audits mark them Malicious.",
@@ -614,20 +659,33 @@ async def flag_command(
     embed = build_audit_embed(member, result)
     updated = await _post_or_update_audit(member.id, member.guild.id, embed)
 
-    log_content = (
+    local_content = (
         f"{interaction.user.mention} flagged {member.mention}"
         + (f" — {reason_text}" if reason_text else "")
+        + "\nChoose:"
     )
+    local_view = enforcement.cross_guild_alert_view(member.id, interaction.guild.id)
     await _post_notice(
         interaction.guild.id,
-        log_content,
+        local_content,
         reply_to_message_id=updated.id if updated else None,
+        view=local_view,
     )
 
-    await interaction.followup.send(
-        f"Added **{member}** to the blocklist.",
-        ephemeral=True,
+    alert_count = await _dispatch_cross_guild_alerts(
+        user_id=member.id,
+        flagged_by_id=interaction.user.id,
+        reason=reason_text,
+        originating_guild_id=interaction.guild.id,
     )
+
+    summary = f"Added **{member}** to the blocklist."
+    if alert_count > 0:
+        summary += (
+            f" Posted **{alert_count}** cross-server alert(s) in other "
+            "guilds where they're currently a member."
+        )
+    await interaction.followup.send(summary, ephemeral=True)
 
 
 @bot.tree.command(
@@ -1044,6 +1102,164 @@ async def enforcement_malicious(
 
 
 bot.tree.add_command(enforcement_group)
+
+
+@bot.tree.command(
+    name="audit-guild-blocklist",
+    description="Scan this guild's current members against the blocklist and list matches.",
+)
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(moderate_members=True)
+async def audit_guild_blocklist_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    matches: list[tuple[discord.Member, list[db.Flag]]] = []
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        flags = await db.get_active_flags(member.id)
+        if flags:
+            matches.append((member, flags))
+
+    if not matches:
+        await interaction.followup.send(
+            "No current members of this guild are on the blocklist. Clean.",
+            ephemeral=True,
+        )
+        return
+
+    matches.sort(key=lambda entry: len(entry[1]), reverse=True)
+    lines = [f"**{len(matches)} member(s) on the blocklist:**", ""]
+    for member, flags in matches[:25]:
+        guild_names: list[str] = []
+        for f in flags:
+            g = bot.get_guild(f.guild_id)
+            guild_names.append(g.name if g else f"g:{f.guild_id}")
+        lines.append(
+            f"• {member.mention} (`{member.id}`) — "
+            f"**{len(flags)} flag(s)**: {', '.join(guild_names)}"
+        )
+    if len(matches) > 25:
+        lines.append(f"…and {len(matches) - 25} more not shown.")
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(
+    name="purge-flagged",
+    description="Apply this guild's malicious_action to every currently-in-guild flagged member.",
+)
+@app_commands.describe(
+    action="dry_run lists what would happen. execute performs the actions.",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="dry_run (list only, no action)", value="dry_run"),
+    app_commands.Choice(name="execute (apply malicious_action)", value="execute"),
+])
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def purge_flagged_command(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    config = await db.get_guild_config(interaction.guild.id)
+
+    if action.value == "execute" and config.mode != "active":
+        await interaction.followup.send(
+            "Refusing to execute: enforcement mode is `shadow`. "
+            "Run `/enforcement mode new_mode:active` first, or use `dry_run` to preview.",
+            ephemeral=True,
+        )
+        return
+
+    targets: list[discord.Member] = []
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        flags = await db.get_active_flags(member.id)
+        if flags:
+            targets.append(member)
+
+    if not targets:
+        await interaction.followup.send(
+            "No current members are on the blocklist. Nothing to purge.",
+            ephemeral=True,
+        )
+        return
+
+    if action.value == "dry_run":
+        lines = [
+            f"**Dry run — {len(targets)} flagged member(s) currently in guild.**",
+            f"Configured malicious_action: `{config.malicious_action}`",
+            "",
+            "Would act on:",
+        ]
+        for m in targets[:20]:
+            lines.append(f"• {m.mention} (`{m.id}`)")
+        if len(targets) > 20:
+            lines.append(f"…and {len(targets) - 20} more.")
+        lines.append("")
+        lines.append("Re-run with `action:execute` to apply.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        return
+
+    kicked = 0
+    banned = 0
+    held = 0
+    failed: list[str] = []
+
+    for member in targets:
+        try:
+            if config.malicious_action == "ban":
+                await member.ban(
+                    reason=f"Regulus /purge-flagged by {interaction.user}",
+                    delete_message_seconds=86400,
+                )
+                banned += 1
+            elif config.malicious_action == "kick":
+                await member.kick(
+                    reason=f"Regulus /purge-flagged by {interaction.user}",
+                )
+                kicked += 1
+            elif config.malicious_action == "hold":
+                if config.unverified_role_id is None:
+                    failed.append(f"{member.mention}: no Unverified role")
+                    continue
+                role = interaction.guild.get_role(config.unverified_role_id)
+                if role is None:
+                    failed.append(f"{member.mention}: Unverified role missing")
+                    continue
+                await member.add_roles(
+                    role,
+                    reason=f"Regulus /purge-flagged by {interaction.user}",
+                )
+                held += 1
+        except discord.Forbidden:
+            failed.append(f"{member.mention}: missing permission")
+        except discord.HTTPException as e:
+            failed.append(f"{member.mention}: {e}")
+
+    summary_lines = [
+        f"**Purge complete.** Action: `{config.malicious_action}`",
+        f"Kicked: **{kicked}**  •  Banned: **{banned}**  •  Held: **{held}**",
+    ]
+    if failed:
+        summary_lines.append(f"Failed on **{len(failed)}** member(s):")
+        for f in failed[:10]:
+            summary_lines.append(f"• {f}")
+        if len(failed) > 10:
+            summary_lines.append(f"…and {len(failed) - 10} more.")
+    await interaction.followup.send("\n".join(summary_lines), ephemeral=True)
+
+    total_acted = kicked + banned + held
+    if total_acted > 0:
+        await _post_notice(
+            interaction.guild.id,
+            f"{interaction.user.mention} ran `/purge-flagged` — "
+            f"acted on {total_acted} member(s) via `{config.malicious_action}`.",
+        )
 
 
 @bot.tree.error

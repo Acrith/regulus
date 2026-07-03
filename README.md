@@ -139,8 +139,10 @@ Both commands reply ephemerally so the target member cannot see the response, an
 | `/audit member:@user`                      | Runs the trust audit on `@user` and returns the audit embed ephemerally.                                       |
 | Right-click a user → **Apps → Audit user** | Same as `/audit`, invoked via context menu.                                                                    |
 | `/audit-id user_id:<int>`                  | Audits any Discord user by raw ID — works for banned/left users. Member-only signals (server booster, live onboarding state) return `n/a`; historical DB data still contributes. |
-| `/flag member:@user reason:"..."`          | Adds the user to the blocklist. Posts a public notice + updated audit embed to the mod channel.                |
+| `/flag member:@user reason:"..."`          | Adds the user to the blocklist. Posts a local notice with `[Ban] [Kick] [Hold] [Ignore]` buttons in the mod channel, and dispatches the same alert to every other guild where the user is a member AND enforcement is `active`. Buttons act only in the guild the notice was posted in. |
 | `/unflag member:@user`                     | Deactivates all active flags for the user. Posts a public notice to the mod channel.                           |
+| `/audit-guild-blocklist`                   | Scans the current guild's member list against active flags and returns an ephemeral list of matches, sorted by flag count. Fast — no Discord API calls per member, just DB lookups. |
+| `/purge-flagged action:<dry_run\|execute>`  | Applies the guild's `malicious_action` to every currently-in-guild flagged member. `dry_run` lists targets; `execute` performs the actions. Requires `Manage Guild` and refuses to execute in `shadow` mode. |
 | `/enforcement show`                        | Displays current per-guild enforcement configuration.                                                          |
 | `/enforcement mode new_mode:<shadow\|active>` | Flip the guild's enforcement mode. `shadow` = observe only. `active` = act on join per band.                   |
 | `/enforcement hold_below band:<band>`      | Bands strictly worse than this are held on `@Unverified` when enforcement is active.                           |
@@ -224,6 +226,22 @@ Any button click also refuses users who lack `Moderate Members` in the guild, so
 | `updated_by`         | `NULL`         | User ID of the mod who made the last change.                                              |
 
 Rows are created lazily when a guild is first read via `get_guild_config`. Every change made via `/enforcement` posts a notice to the guild's mod channel with the actor and the change, providing an audit trail.
+
+### Cross-server threat alerts
+
+When any moderator runs `/flag` in any guild, Regulus dispatches a **threat alert** to every other guild where:
+
+1. The user is currently a member,
+2. Enforcement mode is `active`, and
+3. The guild is listed in `GUILDS`.
+
+Each alert is a plain-text notice in that guild's mod channel with `[Ban] [Kick] [Hold] [Ignore]` buttons. **Buttons act only in the guild the notice was posted in** — a mod in Server B clicking `[Ban]` bans the user from Server B only. Server A's mods (who originated the flag) get their own local notice with the same button set for the same reason. Every mod team decides for their own guild.
+
+This preserves each guild's autonomy while sharing intelligence at the speed of a single command. If a hijacked account is caught in one server, allied servers get the alert within seconds and can each independently take the local action they judge appropriate.
+
+Alerts do not run a fresh audit in each notified guild (that would be expensive). Mods can run `/audit member:@user` locally if they want the full picture before clicking a button.
+
+If a guild is in `shadow` mode, it receives no alert at all — shadow mode is a **defence-in-depth** posture that opts out of both automatic enforcement AND cross-guild reactive alerts.
 
 ### Native-ban mirroring
 

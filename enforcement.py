@@ -263,12 +263,206 @@ class UndoKickButton(
         await _finalise(interaction, f"Undone ({note})")
 
 
+# ---------- Cross-guild threat-alert buttons ----------
+
+async def _act_ban(interaction: discord.Interaction, user_id: int) -> bool:
+    guild = interaction.guild
+    member = guild.get_member(user_id)
+    reason = f"Regulus alert action by {interaction.user}"
+    try:
+        if member is not None:
+            await member.ban(reason=reason, delete_message_seconds=86400)
+        else:
+            await guild.ban(discord.Object(id=user_id), reason=reason,
+                            delete_message_seconds=86400)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I don't have the Ban Members permission here.", ephemeral=True,
+        )
+        return False
+    except discord.HTTPException as e:
+        await interaction.response.send_message(
+            f"Ban failed: `{e}`", ephemeral=True,
+        )
+        return False
+    await db.add_flag(
+        user_id=user_id, guild_id=interaction.guild.id,
+        flagged_by=interaction.user.id,
+        reason="cross-guild alert: Ban",
+    )
+    return True
+
+
+async def _act_kick(interaction: discord.Interaction, user_id: int) -> bool:
+    member = interaction.guild.get_member(user_id)
+    if member is None:
+        await interaction.response.send_message(
+            "That user is no longer in this guild.", ephemeral=True,
+        )
+        return False
+    try:
+        await member.kick(reason=f"Regulus alert action by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I don't have the Kick Members permission here.", ephemeral=True,
+        )
+        return False
+    except discord.HTTPException as e:
+        await interaction.response.send_message(
+            f"Kick failed: `{e}`", ephemeral=True,
+        )
+        return False
+    return True
+
+
+async def _act_hold(interaction: discord.Interaction, user_id: int) -> bool:
+    member = interaction.guild.get_member(user_id)
+    if member is None:
+        await interaction.response.send_message(
+            "That user is no longer in this guild.", ephemeral=True,
+        )
+        return False
+    config = await db.get_guild_config(interaction.guild.id)
+    if config.unverified_role_id is None:
+        await interaction.response.send_message(
+            "No Unverified role configured — run `/setup-unverified` first.",
+            ephemeral=True,
+        )
+        return False
+    role = interaction.guild.get_role(config.unverified_role_id)
+    if role is None:
+        await interaction.response.send_message(
+            "The configured Unverified role no longer exists.", ephemeral=True,
+        )
+        return False
+    try:
+        await member.add_roles(role, reason=f"Regulus alert action by {interaction.user}")
+    except discord.HTTPException as e:
+        await interaction.response.send_message(
+            f"Failed to assign role: `{e}`", ephemeral=True,
+        )
+        return False
+    return True
+
+
+class CrossGuildBanButton(
+    DynamicItem[Button],
+    template=r"regulus:cg_ban:(?P<user_id>\d+):(?P<guild_id>\d+)",
+):
+    def __init__(self, user_id: int, guild_id: int) -> None:
+        super().__init__(Button(
+            style=discord.ButtonStyle.danger,
+            label="Ban",
+            custom_id=f"regulus:cg_ban:{user_id}:{guild_id}",
+        ))
+        self.user_id = user_id
+        self.guild_id = guild_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["user_id"]), int(match["guild_id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _mod_only(interaction):
+            await _refuse_non_mod(interaction)
+            return
+        if await _act_ban(interaction, self.user_id):
+            await _finalise(interaction, "Banned")
+
+
+class CrossGuildKickButton(
+    DynamicItem[Button],
+    template=r"regulus:cg_kick:(?P<user_id>\d+):(?P<guild_id>\d+)",
+):
+    def __init__(self, user_id: int, guild_id: int) -> None:
+        super().__init__(Button(
+            style=discord.ButtonStyle.danger,
+            label="Kick",
+            custom_id=f"regulus:cg_kick:{user_id}:{guild_id}",
+        ))
+        self.user_id = user_id
+        self.guild_id = guild_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["user_id"]), int(match["guild_id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _mod_only(interaction):
+            await _refuse_non_mod(interaction)
+            return
+        if await _act_kick(interaction, self.user_id):
+            await _finalise(interaction, "Kicked")
+
+
+class CrossGuildHoldButton(
+    DynamicItem[Button],
+    template=r"regulus:cg_hold:(?P<user_id>\d+):(?P<guild_id>\d+)",
+):
+    def __init__(self, user_id: int, guild_id: int) -> None:
+        super().__init__(Button(
+            style=discord.ButtonStyle.secondary,
+            label="Hold",
+            custom_id=f"regulus:cg_hold:{user_id}:{guild_id}",
+        ))
+        self.user_id = user_id
+        self.guild_id = guild_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["user_id"]), int(match["guild_id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _mod_only(interaction):
+            await _refuse_non_mod(interaction)
+            return
+        if await _act_hold(interaction, self.user_id):
+            await _finalise(interaction, "Held (Unverified assigned)")
+
+
+class CrossGuildIgnoreButton(
+    DynamicItem[Button],
+    template=r"regulus:cg_ignore:(?P<user_id>\d+):(?P<guild_id>\d+)",
+):
+    def __init__(self, user_id: int, guild_id: int) -> None:
+        super().__init__(Button(
+            style=discord.ButtonStyle.secondary,
+            label="Ignore",
+            custom_id=f"regulus:cg_ignore:{user_id}:{guild_id}",
+        ))
+        self.user_id = user_id
+        self.guild_id = guild_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["user_id"]), int(match["guild_id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _mod_only(interaction):
+            await _refuse_non_mod(interaction)
+            return
+        await _finalise(interaction, "Ignored (no action)")
+
+
+def cross_guild_alert_view(user_id: int, guild_id: int) -> View:
+    view = View(timeout=None)
+    view.add_item(CrossGuildBanButton(user_id, guild_id))
+    view.add_item(CrossGuildKickButton(user_id, guild_id))
+    view.add_item(CrossGuildHoldButton(user_id, guild_id))
+    view.add_item(CrossGuildIgnoreButton(user_id, guild_id))
+    return view
+
+
 ALL_DYNAMIC_ITEMS: ClassVar[tuple] = (
     HoldApproveButton,
     HoldDenyButton,
     HoldWatchButton,
     UndoBanButton,
     UndoKickButton,
+    CrossGuildBanButton,
+    CrossGuildKickButton,
+    CrossGuildHoldButton,
+    CrossGuildIgnoreButton,
 )
 
 
