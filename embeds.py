@@ -38,12 +38,10 @@ def build_audit_embed(
         inline=False,
     )
     for signal in result.signals:
-        prominent = signal.prominent and not (
-            signal.name == "Blocklist" and signal.weight == 0
-        )
+        weight_suffix = f"  ({signal.weight:+d})" if signal.weight != 0 else ""
         embed.add_field(
             name=signal.name,
-            value=f"{signal.detail}  ({signal.weight:+d})",
-            inline=not prominent,
+            value=f"{signal.detail}{weight_suffix}",
+            inline=not signal.prominent,
         )
     return embed

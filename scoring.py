@@ -71,7 +71,7 @@ def _parse_ts(ts: str) -> datetime:
 def _signal_blocklist(ctx: AuditContext) -> Signal:
     flag = ctx.active_flag
     if flag is None:
-        return Signal("Blocklist", "clean", 0)
+        return Signal("Not on blocklist", "​", 0, prominent=True)
     date = flag.created_at[:10]
     reason = flag.reason or "no reason given"
     guild = ctx.client.get_guild(flag.guild_id) if ctx.client else None
@@ -100,7 +100,7 @@ def _signal_invite(ctx: AuditContext) -> Signal:
             prominent=True,
         )
 
-    # Fallback: reconstruct from the member record persisted at join.
+    # Fallback: reconstruct from the member record captured at join.
     record = ctx.member_record
     if record and record.invite_code:
         if record.invite_inviter_id:
@@ -112,7 +112,7 @@ def _signal_invite(ctx: AuditContext) -> Signal:
             creator_str = "unknown"
         return Signal(
             "Invite",
-            f"`{record.invite_code}` — by {creator_str} (persisted at join)",
+            f"`{record.invite_code}` — by {creator_str}",
             0,
             prominent=True,
         )
@@ -213,9 +213,9 @@ def _signal_onboarding_speed(ctx: AuditContext) -> Signal:
     if record.onboarding_completed_at is not None:
         elapsed = (_parse_ts(record.onboarding_completed_at)
                    - _parse_ts(record.joined_at)).total_seconds()
-        if elapsed < 5:
+        if elapsed < 7:
             weight, note = -3, "**speedrun**"
-        elif elapsed < 30:
+        elif elapsed < 15:
             weight, note = -1, "fast, no reading"
         elif elapsed < 30 * 60:
             weight, note = 0, "normal"
