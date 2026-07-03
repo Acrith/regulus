@@ -44,15 +44,17 @@ def _parse_guilds(raw: str) -> dict[int, int]:
     return result
 
 
-if not TOKEN:
-    raise SystemExit("DISCORD_TOKEN missing from .env")
-GUILDS: dict[int, int] = _parse_guilds(os.getenv("GUILDS", ""))
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
 )
 log = logging.getLogger("regulus")
+
+if not TOKEN:
+    raise SystemExit("DISCORD_TOKEN missing from .env")
+GUILDS: dict[int, int] = _parse_guilds(os.getenv("GUILDS", ""))
+log.info("configured guilds (%d): %s",
+         len(GUILDS), ", ".join(str(g) for g in GUILDS))
 
 intents = discord.Intents.default()
 intents.members = True
