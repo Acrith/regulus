@@ -601,7 +601,8 @@ async def setup_unverified_command(
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    updated = 0
+    channels_updated = 0
+    categories_updated = 0
     opened_names: list[str] = []
     skipped: list[str] = []
     for channel in guild.channels:
@@ -613,9 +614,12 @@ async def setup_unverified_command(
                 role, overwrite=overwrite,
                 reason=f"Regulus /setup-unverified by {interaction.user}",
             )
-            updated += 1
-            if can_view:
-                opened_names.append(channel.name)
+            if isinstance(channel, discord.CategoryChannel):
+                categories_updated += 1
+            else:
+                channels_updated += 1
+                if can_view:
+                    opened_names.append(channel.name)
         except discord.Forbidden:
             skipped.append(f"#{channel.name} (missing permission)")
         except discord.HTTPException as e:
@@ -627,9 +631,13 @@ async def setup_unverified_command(
         unverified_role_id=role.id,
     )
 
+    cat_word = "category" if categories_updated == 1 else "categories"
     lines = [
         f"**@{role.name}** {'created' if created else 'updated'} — role ID `{role.id}`",
-        f"Applied deny overrides to **{updated}** channel(s).",
+        f"Applied deny overrides to **{channels_updated}** channel(s) "
+        f"and **{categories_updated}** {cat_word}. "
+        f"(Category overrides also propagate to any current or future child "
+        f"channels that don't have their own override.)",
     ]
     if opened_names:
         lines.append("Left viewable: " + ", ".join(f"#{n}" for n in opened_names))
