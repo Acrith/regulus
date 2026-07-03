@@ -138,10 +138,11 @@ async def _post_notice(
     guild_id: int,
     content: str,
     reply_to_message_id: Optional[int] = None,
+    view: Optional[discord.ui.View] = None,
 ) -> Optional[discord.Message]:
     """Post a plain-text notice to the guild's mod channel. If a message
     ID is given, post it as a Discord reply so mods can click through to
-    the referenced audit embed."""
+    the referenced audit embed. A view attaches interactive buttons."""
     mod_channel_id = GUILDS.get(guild_id)
     if mod_channel_id is None:
         return None
@@ -155,13 +156,121 @@ async def _post_notice(
             channel_id=mod_channel_id,
             fail_if_not_exists=False,
         )
+    kwargs: dict[str, object] = {"content": content, "reference": reference}
+    if view is not None:
+        kwargs["view"] = view
     try:
-        return await channel.send(content=content, reference=reference)
+        return await channel.send(**kwargs)
     except discord.Forbidden:
         log.error("cannot post notice: missing permission in #%s", channel.name)
     except discord.HTTPException as e:
         log.error("failed to post notice: %s", e)
     return None
+
+
+async def _enforce_join(
+    member: discord.Member,
+    result: Audit,
+    updated_msg: Optional[discord.Message],
+) -> None:
+    """Consume the guild's enforcement config and act on the audit band."""
+    config = await db.get_guild_config(member.guild.id)
+    action = enforcement.decide_action(result.band, config)
+    if action is enforcement.Action.NONE:
+        return
+
+    reply_id = updated_msg.id if updated_msg is not None else None
+
+    if action is enforcement.Action.HOLD:
+        role_id = config.unverified_role_id
+        if role_id is None:
+            log.error("cannot hold %s: no Unverified role configured", member.id)
+            return
+        role = member.guild.get_role(role_id)
+        if role is None:
+            log.error("cannot hold %s: Unverified role %s not found", member.id, role_id)
+            return
+        try:
+            await member.add_roles(role, reason=f"Regulus enforcement: band={result.band}")
+        except discord.Forbidden:
+            log.error("cannot hold %s: missing Manage Roles or role hierarchy", member.id)
+            await _post_notice(
+                member.guild.id,
+                f"Wanted to assign {role.mention} to {member.mention} "
+                f"(band `{result.band}`) but I don't have permission. "
+                f"Check my Manage Roles perm and that my role is above `{role.name}`.",
+                reply_to_message_id=reply_id,
+            )
+            return
+        except discord.HTTPException as e:
+            log.error("cannot hold %s: %s", member.id, e)
+            return
+        view = enforcement.hold_view(member.id, member.guild.id)
+        await _post_notice(
+            member.guild.id,
+            f"{member.mention} assigned {role.mention} — band `{result.band}`. Choose:",
+            reply_to_message_id=reply_id,
+            view=view,
+        )
+        return
+
+    if action is enforcement.Action.KICK:
+        try:
+            await member.kick(reason=f"Regulus enforcement: band={result.band}")
+        except discord.Forbidden:
+            log.error("cannot kick %s: missing Kick Members", member.id)
+            await _post_notice(
+                member.guild.id,
+                f"Wanted to kick {member.mention} (band `{result.band}`) but I "
+                "don't have the Kick Members permission.",
+                reply_to_message_id=reply_id,
+            )
+            return
+        except discord.HTTPException as e:
+            log.error("cannot kick %s: %s", member.id, e)
+            return
+        view = enforcement.undo_view(member.id, member.guild.id, enforcement.Action.KICK)
+        await _post_notice(
+            member.guild.id,
+            f"Auto-kicked **{member}** (`{member.id}`) — band `{result.band}`.",
+            reply_to_message_id=reply_id,
+            view=view,
+        )
+        return
+
+    if action is enforcement.Action.BAN:
+        try:
+            await member.ban(
+                reason=f"Regulus enforcement: band={result.band}",
+                delete_message_seconds=86400,
+            )
+        except discord.Forbidden:
+            log.error("cannot ban %s: missing Ban Members", member.id)
+            await _post_notice(
+                member.guild.id,
+                f"Wanted to ban {member.mention} (band `{result.band}`) but I "
+                "don't have the Ban Members permission.",
+                reply_to_message_id=reply_id,
+            )
+            return
+        except discord.HTTPException as e:
+            log.error("cannot ban %s: %s", member.id, e)
+            return
+        await db.add_flag(
+            user_id=member.id,
+            guild_id=member.guild.id,
+            flagged_by=bot.user.id if bot.user else 0,
+            reason=f"auto-enforcement ban: band={result.band}",
+        )
+        view = enforcement.undo_view(member.id, member.guild.id, enforcement.Action.BAN)
+        await _post_notice(
+            member.guild.id,
+            f"Auto-banned **{member}** (`{member.id}`) — band `{result.band}`. "
+            "Last 24h of their messages deleted; auto-flagged for future audits.",
+            reply_to_message_id=reply_id,
+            view=view,
+        )
+        return
 
 
 async def _bootstrap_members(guild: discord.Guild) -> None:
@@ -187,6 +296,9 @@ async def _bootstrap_members(guild: discord.Guild) -> None:
 async def setup_hook():
     await db.init()
     log.info("database initialised at %s", db.DB_PATH)
+    for item_cls in enforcement.ALL_DYNAMIC_ITEMS:
+        bot.add_dynamic_items(item_cls)
+    log.info("registered %d persistent button item(s)", len(enforcement.ALL_DYNAMIC_ITEMS))
     for guild_id in GUILDS:
         guild = discord.Object(id=guild_id)
         bot.tree.copy_global_to(guild=guild)
@@ -260,7 +372,8 @@ async def on_member_join(member: discord.Member):
              invite_code or "unknown")
 
     embed = build_audit_embed(member, result)
-    await _post_or_update_audit(member.id, member.guild.id, embed)
+    updated = await _post_or_update_audit(member.id, member.guild.id, embed)
+    await _enforce_join(member, result, updated)
 
 
 def _detect_onboarding_completed(before: discord.Member, after: discord.Member) -> bool:
@@ -771,16 +884,13 @@ async def enforcement_show(interaction: discord.Interaction) -> None:
     lines = [
         f"**Mode:** `{config.mode}`  "
         + ("(**not enforcing** — audits only)" if config.mode == "shadow"
-           else "(**enforcing** join actions)"),
+           else "(**enforcing** — hold / kick / ban on join per band)"),
         f"**Hold threshold:** below `{config.hold_below_band}` — "
         f"{_describe_hold_effect(config.hold_below_band)}",
         f"**Malicious action:** `{config.malicious_action}`",
         f"**Unverified role:** {role_line}",
         f"**Last updated:** `{config.updated_at}`"
         + (f" by <@{config.updated_by}>" if config.updated_by else ""),
-        "",
-        "_Note: even in `active` mode, enforcement dispatch on member join_",
-        "_is not yet wired in — this will land in a subsequent commit._",
     ]
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 

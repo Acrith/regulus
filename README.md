@@ -2,7 +2,7 @@
 
 Trust-tier moderation bot for Discord community servers. Designed to defend against scam-account raids by auditing new joiners against configurable signals, gating channel access behind an `@Unverified` role, and escalating suspicious accounts to moderator review.
 
-**Status: shadow-mode audit + local blocklist + invite tracking + behavioural signals + enforcement config (dispatch not yet wired).** On member join the bot computes a trust score from twelve signals (blocklist match, invite used, mutual servers with the bot, account age, avatar, banner, avatar decoration, server-boost status, public flags, username pattern, onboarding speed, first-message timing), maps it to a band, and posts an audit embed to a configured moderator channel. Behavioural signals update as events unfold — when a member completes Onboarding and when they send their first message, the mod channel gets a notice plus an updated audit embed reflecting the new information. Every audit — automatic or manual — is persisted to a local SQLite database. Moderators can `/flag @user` to add someone to the blocklist (auto-Malicious on future audits) or `/unflag @user` to remove them. Manual audits are available via `/audit @user` or `/audit-id user_id:<int>` or the right-click **Apps → Audit user** menu. **Every audit is still informational only — no roles are assigned, no automatic actions are taken.** The per-guild enforcement config exists (`/setup-unverified`, `/enforcement`) so a moderator can prepare the `@Unverified` role and pick thresholds, but the on-join dispatch that would actually consume those settings will land in a subsequent commit. See [Design (planned)](#design-planned) below for what is still ahead.
+**Status: shadow or active enforcement, per guild.** On member join the bot computes a trust score from twelve signals (blocklist match, invite used, mutual servers with the bot, account age, avatar, banner, avatar decoration, server-boost status, public flags, username pattern, onboarding speed, first-message timing), maps it to a band, and posts an audit embed to a configured moderator channel. Behavioural signals update as events unfold — when a member completes Onboarding and when they send their first message, the mod channel gets a notice plus an updated audit embed reflecting the new information. Every audit — automatic or manual — is persisted to a local SQLite database. Moderators can `/flag @user` to add someone to the blocklist (auto-Malicious on future audits) or `/unflag @user` to remove them. Manual audits are available via `/audit @user` or `/audit-id user_id:<int>` or the right-click **Apps → Audit user** menu. Each guild's enforcement mode is independently configurable via `/enforcement`: **`shadow`** posts audits and does nothing else; **`active`** additionally assigns `@Unverified` to joiners scoring below the configured band threshold and kicks / bans / holds Malicious joiners per config. Hold notices carry interactive `[Approve] [Deny] [Watch]` buttons; kick / ban notices carry `[Undo]`. Buttons persist across bot restarts. See [Design (planned)](#design-planned) below for what is still ahead — chiefly the hot-triggers commit that catches scam behaviour from members who are already inside.
 
 ---
 
@@ -141,9 +141,9 @@ Both commands reply ephemerally so the target member cannot see the response, an
 | `/flag member:@user reason:"..."`          | Adds the user to the blocklist. Posts a public notice + updated audit embed to the mod channel.                |
 | `/unflag member:@user`                     | Deactivates all active flags for the user. Posts a public notice to the mod channel.                           |
 | `/enforcement show`                        | Displays current per-guild enforcement configuration.                                                          |
-| `/enforcement mode new_mode:<shadow\|active>` | Flip the guild's enforcement mode. `shadow` = observe only. `active` = act on join (dispatch not yet wired).   |
+| `/enforcement mode new_mode:<shadow\|active>` | Flip the guild's enforcement mode. `shadow` = observe only. `active` = act on join per band.                   |
 | `/enforcement hold_below band:<band>`      | Bands strictly worse than this are held on `@Unverified` when enforcement is active.                           |
-| `/enforcement malicious action:<kick\|ban\|hold>` | What to do with joiners scored Malicious (once dispatch lands).                                            |
+| `/enforcement malicious action:<kick\|ban\|hold>` | What to do with joiners scored Malicious. Bans also auto-flag so a rejoin under the same ID lands Malicious. |
 | `/setup-unverified role_name:<str> open_channels:<str>` | **Server-owner tier.** Creates the `@Unverified` role and applies deny overrides on every channel. `open_channels` is a comma-separated list of channel names that remain viewable (e.g. `welcome,rules`). Requires `Manage Guild`. Idempotent — safe to re-run when adding new channels. |
 
 Commands are guild-scoped and sync at startup for every server listed in `GUILDS` — they appear in Discord within a second or two of the bot connecting. Users without the required permission get a clean ephemeral refusal message.
@@ -172,11 +172,9 @@ The blocklist is **global to this bot instance** — a flag added while auditing
 
 The following are still to be built. As features land, bullets move out of here and into the operator sections above.
 
-- **Enforcement dispatch on join.** The per-guild config already exists (see [Enforcement](#enforcement) below). What is missing is `on_member_join` consuming that config to actually assign `@Unverified`, kick, ban, or hold based on band. Landing next.
-- **Interactive `[Approve] [Deny] [Watch]` buttons** on the join notice for members held on `@Unverified`. Persistent `discord.ui.View` so buttons survive a bot restart.
-- **Hot triggers.** Behavioural shortcuts on any member — Discord invite in message, phishing URL patterns, attachment + role-mention combo, cross-post spam across channels within 30 seconds. Tiered by tenure (auto-action within first 7 days, alert-with-buttons for older members). Hard triggers can `[Ban+Purge]` in one click; the `[Undo]` button reverses everything (unban + unflag + best-effort DM invite).
-- **More commands.** `/approve @user`, `/deny @user`, `/watchlist` mirror the buttons.
-- **Blocklist by more than user ID.** Flag entries currently key on `user_id` only. Add username and avatar-hash matching so a scammer that returns under a new account with the same profile still triggers the blocklist signal.
+- **Hot triggers.** Behavioural shortcuts on any member — Discord invite in message, phishing URL patterns, attachment + role-mention combo, cross-post spam across channels within 30 seconds. Tiered by tenure (auto-action within first 7 days, alert-with-buttons for older members). Hard triggers can `[Ban+Purge]` in one click; `[Undo]` reverses everything.
+- **More commands.** `/approve @user`, `/deny @user`, `/watchlist` mirror the buttons (button clicks work today; slash-command mirrors are for cases where the notice has scrolled out of view).
+- **Blocklist by more than user ID.** Flag entries currently key on `user_id` only. Add username and avatar-hash matching so a scammer returning under a new account with the same profile still triggers the blocklist signal.
 
 ## Enforcement
 
@@ -186,6 +184,30 @@ Enforcement is **off by default**. Every guild starts in `shadow` mode where the
 2. Run `/enforcement mode new_mode:active` — flips the guild's config in the `guild_config` table.
 
 Neither step affects any guild the bot is a member of but is not in `GUILDS`. Guilds hosting the bot with `permissions=0` (no elevated permissions) cannot be affected by enforcement regardless of code state — Discord enforces permissions server-side, so a bot without `Manage Roles` cannot assign roles even if it tried to.
+
+### What `active` mode actually does
+
+Each new join runs the trust audit. Based on the result and the guild's config:
+
+| Band            | Config-controlled action                                                             |
+|-----------------|--------------------------------------------------------------------------------------|
+| Trusted         | No action.                                                                            |
+| Likely-safe     | No action (with default `hold_below_band=Likely-safe`).                              |
+| Neutral         | Assign `@Unverified`. Notice + Approve / Deny / Watch buttons.                       |
+| Suspicious      | Assign `@Unverified`. Notice + buttons.                                              |
+| Malicious       | `malicious_action` decides: `kick`, `ban` (also auto-flags), or `hold`.              |
+
+Interactive buttons on the notice:
+
+- **Approve** (on hold) — removes `@Unverified`. Strikes through the notice.
+- **Deny** (on hold) — kicks + auto-flags. Strikes through the notice.
+- **Watch** (on hold) — keeps `@Unverified` in place, records the mod's decision. (Behavioural escalation for watched members is coming with the hot-triggers commit.)
+- **Undo ban** (on ban) — lifts the ban and clears the auto-flag so the user can rejoin cleanly.
+- **Undo** (on kick) — clears any auto-flags. The user can rejoin freely; kicks are not persistent.
+
+Buttons use `discord.ui.DynamicItem` with template-matched `custom_id`s (`regulus:hold_approve:USER:GUILD` etc.), registered at startup. They survive bot restarts — you don't lose the ability to Approve a held user just because Regulus was restarted between join and click.
+
+Any button click also refuses users who lack `Moderate Members` in the guild, so a plain member who somehow sees the notice cannot trigger enforcement actions on other members.
 
 ### Configuration table
 
