@@ -2,7 +2,7 @@
 
 Trust-tier moderation bot for Discord community servers. Designed to defend against scam-account raids by auditing new joiners against configurable signals, gating channel access behind an `@Unverified` role, and escalating suspicious accounts to moderator review.
 
-**Status: shadow-mode audit.** On member join the bot computes a trust score from static account signals (age, avatar, public flags, username pattern), maps it to a band, and posts a signed audit embed to a configured moderator channel. **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for the enforcement layer and everything else still on the roadmap.
+**Status: shadow-mode audit.** On member join the bot computes a trust score from static account signals (age, avatar, public flags, username pattern), maps it to a band, and posts a signed audit embed to a configured moderator channel. Moderators can also rerun the audit against any member on demand via `/audit @user` or the right-click **Apps → Audit user** menu (both are mod-only and reply ephemerally). **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for the enforcement layer and everything else still on the roadmap.
 
 ---
 
@@ -77,6 +77,17 @@ Bands, from highest score to lowest: `Trusted`, `Likely-safe`, `Neutral`, `Suspi
 
 Stop the bot with `Ctrl+C`.
 
+## Moderator commands
+
+Available to any user with the `Manage Messages` permission (adjustable per-command in **Server Settings → Integrations → Regulus**). Both reply ephemerally so the target member cannot see the response.
+
+| Trigger                                 | Effect                                                            |
+|-----------------------------------------|-------------------------------------------------------------------|
+| `/audit member:@user`                   | Runs the trust audit on `@user` and returns the audit embed.      |
+| Right-click a user → **Apps → Audit user** | Same as `/audit`, invoked via context menu.                     |
+
+Commands are guild-scoped and sync at startup — they appear in Discord within a second or two of the bot connecting.
+
 ## Repository layout
 
 | Path              | Purpose                                                          |
@@ -100,6 +111,6 @@ The following are still to be built. As features land, bullets move out of here 
 - **Additional signals.** Invite used, mutual-server count, banner presence, blocklist match. All wire into the same `Audit` structure and appear in the same embed.
 - **Personal invites.** Joining via a mod-issued personal invite will contribute a strong positive weight, near auto-approval.
 - **Interactive buttons.** The audit embed will grow `[Approve] [Deny] [Watch]` buttons wired to bot actions.
-- **Commands.** `/audit @user` reruns the audit on demand; `/flag @user reason` adds to the local blocklist; `/approve @user`, `/deny @user`, `/watchlist` mirror the buttons.
+- **More commands.** `/flag @user reason` adds to the local blocklist; `/approve @user`, `/deny @user`, `/watchlist` mirror the buttons.
 - **Local blocklist.** Manually-flagged user IDs, usernames, and avatar hashes persist to SQLite across leave/rejoin and inform future scores.
 - **Manual override.** Every automatic action will be undoable from the audit channel.
