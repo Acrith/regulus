@@ -101,18 +101,10 @@ def _signal_mutual_servers(ctx: AuditContext) -> Signal:
         return Signal("Mutual servers", "n/a (bot in 1 guild)", 0)
     mutuals = [g for g in ctx.member.mutual_guilds if g.id != ctx.member.guild.id]
     n = len(mutuals)
-    if n == 0:
-        weight = -2
-    elif n == 1:
-        weight = 0
-    elif n == 2:
-        weight = 1
-    else:
-        weight = min(n, 3)
     return Signal(
         "Mutual servers",
-        f"shares {n} of {other_guilds_available} other bot-guilds",
-        weight,
+        f"shares {n} of {other_guilds_available} other bot-guilds (informational)",
+        0,
     )
 
 

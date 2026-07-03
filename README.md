@@ -108,7 +108,7 @@ Current signals, defined in `scoring.py`:
 |---------------------|--------------------------------------|--------------------|----------------------------------------------------------------------------------------------------|
 | Blocklist           | local SQLite `flags` table           | 0 or −10           | Overrides everything: a flag drops the user to Malicious. Set via `/flag`.                        |
 | Invite              | per-guild invite cache               | 0 (informational)  | Which invite was used, by whom, use count. `unknown` on vanity URL, cold cache, or `/audit` runs.  |
-| Mutual servers      | `member.mutual_guilds` + `bot.guilds` | −2 to +3           | Shared server count with the bot (excluding the current guild). Weak until the bot is in multiple guilds; strong once in several sister communities. |
+| Mutual servers      | `member.mutual_guilds` + `bot.guilds` | 0 (informational)  | Shared server count with the bot (excluding the current guild). Currently unweighted — penalising 0 mutuals only makes sense once the bot is in several sister communities. Re-enable a negative weight for 0 mutuals when the bot is running on 4+ sister servers. |
 | Account age         | `member.created_at`                  | −3 to +2           | Days since Discord account creation.                                                               |
 | Avatar              | `member.avatar` + `is_animated()`    | −2, +1, or +2      | Default: −2. Static custom: +1. Animated (Nitro-only): +2.                                         |
 | Banner              | `full_user.banner`                   | 0 or +1            | Custom banner requires Nitro; weak positive.                                                       |
