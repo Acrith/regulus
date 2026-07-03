@@ -548,14 +548,20 @@ def _resolve_role_reference(
     return discord.utils.get(guild.roles, name=name), name
 
 
-def _parse_open_channels(raw: str, guild: discord.Guild) -> set[str]:
-    """Return a lowercase set of channel names for the open-channels allowlist.
+def _parse_open_channels(
+    raw: str,
+    guild: discord.Guild,
+) -> tuple[set[int], set[str]]:
+    """Split the open-channels input into precise IDs and fuzzy names.
 
-    Accepts both plain names (`welcome`, `#welcome`) and Discord channel
-    mentions (`<#1234567890>`) — the latter is what the slash-command UI
-    produces when the operator types `#` and picks a channel from autocomplete.
-    Unknown mentions are silently dropped.
+    Mentions (`<#1234567890>`) match by channel ID exactly — chosen
+    deliberately from the slash-command UI, no accidental collisions.
+    Plain text (`welcome`, `#welcome`) matches by lowercased name and
+    can therefore hit multiple channels of the same name across different
+    types (e.g. text and voice both named 'general') — that's the price
+    of a name-based match and is documented on the parameter.
     """
+    ids: set[int] = set()
     names: set[str] = set()
     for token in raw.split(","):
         token = token.strip()
@@ -563,12 +569,10 @@ def _parse_open_channels(raw: str, guild: discord.Guild) -> set[str]:
             continue
         m = _CHANNEL_MENTION_RE.fullmatch(token)
         if m is not None:
-            channel = guild.get_channel(int(m.group(1)))
-            if channel is not None:
-                names.add(channel.name.lower())
+            ids.add(int(m.group(1)))
         else:
             names.add(token.lower().lstrip("#"))
-    return names
+    return ids, names
 
 
 def _make_unverified_overwrite(can_view: bool, is_voice: bool) -> discord.PermissionOverwrite:
@@ -577,9 +581,12 @@ def _make_unverified_overwrite(can_view: bool, is_voice: bool) -> discord.Permis
     for perm in _UNVERIFIED_DENY_KEYS:
         setattr(overwrite, perm, False)
     if is_voice:
+        # Unverified is a held state — always deny voice actions, even if
+        # the channel was placed on the open list (view-only sidebar
+        # presence is fine, joining a voice call is not).
         overwrite.speak = False
         overwrite.stream = False
-        overwrite.connect = False if not can_view else None
+        overwrite.connect = False
     return overwrite
 
 
@@ -616,7 +623,7 @@ async def setup_unverified_command(
         )
         return
 
-    open_names = _parse_open_channels(open_channels, guild)
+    open_ids, open_names = _parse_open_channels(open_channels, guild)
 
     role, resolved_role_name = _resolve_role_reference(role_name, guild)
     if _ROLE_MENTION_RE.fullmatch(role_name.strip()) is not None and role is None:
@@ -665,7 +672,10 @@ async def setup_unverified_command(
     opened_names: list[str] = []
     skipped: list[str] = []
     for channel in guild.channels:
-        can_view = channel.name.lower() in open_names
+        can_view = (
+            channel.id in open_ids
+            or channel.name.lower() in open_names
+        )
         is_voice = isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
         overwrite = _make_unverified_overwrite(can_view=can_view, is_voice=is_voice)
         try:
