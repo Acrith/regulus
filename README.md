@@ -2,7 +2,7 @@
 
 Trust-tier moderation bot for Discord community servers. Designed to defend against scam-account raids by auditing new joiners against configurable signals, gating channel access behind an `@Unverified` role, and escalating suspicious accounts to moderator review.
 
-**Status: shadow-mode audit.** On member join the bot computes a trust score from account signals (age, avatar, animated-avatar, banner, avatar decoration, server-boost status, public flags, username pattern), maps it to a band, and posts an audit embed to a configured moderator channel. Moderators can also rerun the audit against any member on demand via `/audit @user` or the right-click **Apps → Audit user** menu (both are mod-only and reply ephemerally). **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for the enforcement layer and everything else still on the roadmap.
+**Status: shadow-mode audit + local blocklist.** On member join the bot computes a trust score from account signals (blocklist match, age, avatar, animated-avatar, banner, avatar decoration, server-boost status, public flags, username pattern), maps it to a band, and posts an audit embed to a configured moderator channel. Every audit — automatic or manual — is persisted to a local SQLite database. Moderators can `/flag @user` to add someone to the blocklist (auto-Malicious on future audits) or `/unflag @user` to remove them. Manual audits are available via `/audit @user` or the right-click **Apps → Audit user** menu. **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for enforcement and everything else still on the roadmap.
 
 ---
 
@@ -47,10 +47,11 @@ Copy the template and fill it in:
 cp .env.example .env            # Windows: copy .env.example .env
 ```
 
-| Variable        | Required | Description                                                              |
-|-----------------|----------|--------------------------------------------------------------------------|
-| `DISCORD_TOKEN` | yes      | Bot token from the Developer Portal.                                     |
-| `GUILDS`        | yes      | Comma-separated pairs of `guild_id:mod_channel_id`. See below.           |
+| Variable        | Required | Description                                                                              |
+|-----------------|----------|------------------------------------------------------------------------------------------|
+| `DISCORD_TOKEN` | yes      | Bot token from the Developer Portal.                                                     |
+| `GUILDS`        | yes      | Comma-separated pairs of `guild_id:mod_channel_id`. See below.                           |
+| `DB_PATH`       | no       | Path to the SQLite database file. Defaults to `regulus.db` alongside `bot.py`.           |
 
 #### Multi-server setup
 
@@ -95,15 +96,16 @@ Bands, from highest score to lowest: `Trusted`, `Likely-safe`, `Neutral`, `Suspi
 
 Current signals, defined in `scoring.py`:
 
-| Signal            | Reads                                | Weight range       | Notes                                                              |
-|-------------------|--------------------------------------|--------------------|--------------------------------------------------------------------|
-| Account age       | `member.created_at`                  | −3 to +2           | Days since Discord account creation.                               |
-| Avatar            | `member.avatar` + `is_animated()`    | −2, +1, or +2      | Default: −2. Static custom: +1. Animated (Nitro-only): +2.         |
-| Banner            | `full_user.banner`                   | 0 or +1            | Custom banner requires Nitro; weak positive.                       |
-| Avatar decoration | `member.avatar_decoration`           | 0 or +1            | Overlay around the avatar; Nitro-only.                             |
-| Server booster    | `member.premium_since`               | 0 or +3            | Boosting the current guild — strong positive.                      |
+| Signal            | Reads                                | Weight range       | Notes                                                                              |
+|-------------------|--------------------------------------|--------------------|------------------------------------------------------------------------------------|
+| Blocklist         | local SQLite `flags` table           | 0 or −10           | Overrides everything: a flag drops the user to Malicious. Set via `/flag`.        |
+| Account age       | `member.created_at`                  | −3 to +2           | Days since Discord account creation.                                               |
+| Avatar            | `member.avatar` + `is_animated()`    | −2, +1, or +2      | Default: −2. Static custom: +1. Animated (Nitro-only): +2.                         |
+| Banner            | `full_user.banner`                   | 0 or +1            | Custom banner requires Nitro; weak positive.                                       |
+| Avatar decoration | `member.avatar_decoration`           | 0 or +1            | Overlay around the avatar; Nitro-only.                                             |
+| Server booster    | `member.premium_since`               | 0 or +3            | Boosting the current guild — strong positive.                                      |
 | Public flags      | `member.public_flags`                | −1 to +3           | HypeSquad / Nitro Early / Active Developer / etc. Limited set exposed by the API. |
-| Username pattern  | regex on `member.name`               | −2 or 0            | Trailing `\d{4,}$` — the `word####` scam signature.                |
+| Username pattern  | regex on `member.name`               | −2 or 0            | Trailing `\d{4,}$` — the `word####` scam signature.                                |
 
 The **Discord API deliberately hides several profile signals from bots** (connections such as Twitch or X, nameplate, display-name colour, profile widgets, current Nitro subscription state for other users). Static scoring therefore has a real ceiling; behavioural triggers and a local blocklist (see below) will close the gap for well-disguised accounts.
 
@@ -118,24 +120,30 @@ Available to any user with the `Moderate Members` (timeout) permission. This is 
 
 Both commands reply ephemerally so the target member cannot see the response, and both are guild-only (no DM invocation).
 
-| Trigger                                    | Effect                                                        |
-|--------------------------------------------|---------------------------------------------------------------|
-| `/audit member:@user`                      | Runs the trust audit on `@user` and returns the audit embed.  |
-| Right-click a user → **Apps → Audit user** | Same as `/audit`, invoked via context menu.                   |
+| Trigger                                    | Effect                                                                                                         |
+|--------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| `/audit member:@user`                      | Runs the trust audit on `@user` and returns the audit embed ephemerally.                                       |
+| Right-click a user → **Apps → Audit user** | Same as `/audit`, invoked via context menu.                                                                    |
+| `/flag member:@user reason:"..."`          | Adds the user to the blocklist. Posts a public notice + updated audit embed to the mod channel.                |
+| `/unflag member:@user`                     | Deactivates all active flags for the user. Posts a public notice to the mod channel.                           |
 
 Commands are guild-scoped and sync at startup for every server listed in `GUILDS` — they appear in Discord within a second or two of the bot connecting. Users without the required permission get a clean ephemeral refusal message.
 
+The blocklist is **global to this bot instance** — a flag added while auditing on your test server also matches on your live server. This is intentional: mods operate one intelligence pool across every server the bot runs on.
+
 ## Repository layout
 
-| Path              | Purpose                                                          |
-|-------------------|------------------------------------------------------------------|
-| `bot.py`          | Entry point, Discord client, event handlers.                     |
-| `scoring.py`      | Signal functions, `Audit` dataclass, score → band mapping.       |
-| `embeds.py`       | Discord embed formatting for the mod-audit channel.              |
-| `requirements.txt`| Python dependencies.                                             |
-| `.env.example`    | Template for local configuration (copy to `.env`).               |
-| `.gitignore`      | Excludes `.env`, `*.db`, `__pycache__`, virtualenvs.             |
-| `README.md`       | This file.                                                       |
+| Path              | Purpose                                                                            |
+|-------------------|------------------------------------------------------------------------------------|
+| `bot.py`          | Entry point, Discord client, event handlers, slash commands.                       |
+| `scoring.py`      | Signal functions, `AuditContext` / `Audit` dataclasses, score → band mapping.      |
+| `embeds.py`       | Discord embed formatting for the mod-audit channel.                                |
+| `db.py`           | SQLite schema and CRUD for the `audits` and `flags` tables.                        |
+| `regulus.db`      | SQLite database file (created on first run, gitignored).                           |
+| `requirements.txt`| Python dependencies.                                                               |
+| `.env.example`    | Template for local configuration (copy to `.env`).                                 |
+| `.gitignore`      | Excludes `.env`, `*.db`, `__pycache__`, virtualenvs.                               |
+| `README.md`       | This file.                                                                         |
 
 ---
 
@@ -148,6 +156,6 @@ The following are still to be built. As features land, bullets move out of here 
 - **Additional signals.** Invite used, mutual-server count, banner presence, blocklist match. All wire into the same `Audit` structure and appear in the same embed.
 - **Personal invites.** Joining via a mod-issued personal invite will contribute a strong positive weight, near auto-approval.
 - **Interactive buttons.** The audit embed will grow `[Approve] [Deny] [Watch]` buttons wired to bot actions.
-- **More commands.** `/flag @user reason` adds to the local blocklist; `/approve @user`, `/deny @user`, `/watchlist` mirror the buttons.
-- **Local blocklist.** Manually-flagged user IDs, usernames, and avatar hashes persist to SQLite across leave/rejoin and inform future scores.
+- **More commands.** `/approve @user`, `/deny @user`, `/watchlist` mirror the buttons.
+- **Blocklist by more than user ID.** Flag entries currently key on `user_id` only. Add username and avatar-hash matching so a scammer that returns under a new account with the same profile still triggers the blocklist signal.
 - **Manual override.** Every automatic action will be undoable from the audit channel.

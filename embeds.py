@@ -33,9 +33,10 @@ def build_audit_embed(member: discord.Member, result: Audit) -> discord.Embed:
         inline=False,
     )
     for signal in result.signals:
+        is_flag_hit = signal.name == "Blocklist" and signal.weight != 0
         embed.add_field(
             name=signal.name,
             value=f"{signal.detail}  ({signal.weight:+d})",
-            inline=True,
+            inline=not is_flag_hit,
         )
     return embed
