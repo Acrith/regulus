@@ -2,7 +2,7 @@
 
 Trust-tier moderation bot for Discord community servers. Designed to defend against scam-account raids by auditing new joiners against configurable signals, gating channel access behind an `@Unverified` role, and escalating suspicious accounts to moderator review.
 
-**Status: shadow-mode audit + local blocklist + invite tracking.** On member join the bot computes a trust score from account signals (blocklist match, age, avatar, animated-avatar, banner, avatar decoration, server-boost status, public flags, username pattern), identifies the invite used, maps the score to a band, and posts an audit embed to a configured moderator channel. Every audit — automatic or manual — is persisted to a local SQLite database. Moderators can `/flag @user` to add someone to the blocklist (auto-Malicious on future audits) or `/unflag @user` to remove them. Manual audits are available via `/audit @user` or the right-click **Apps → Audit user** menu. **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for enforcement and everything else still on the roadmap.
+**Status: shadow-mode audit + local blocklist + invite tracking + behavioural signals.** On member join the bot computes a trust score from twelve signals (blocklist match, invite used, mutual servers with the bot, account age, avatar, banner, avatar decoration, server-boost status, public flags, username pattern, onboarding speed, first-message timing), maps it to a band, and posts an audit embed to a configured moderator channel. Behavioural signals update as events unfold — when a member completes Onboarding and when they send their first message, the mod channel gets a notice plus an updated audit embed reflecting the new information. Every audit — automatic or manual — is persisted to a local SQLite database. Moderators can `/flag @user` to add someone to the blocklist (auto-Malicious on future audits) or `/unflag @user` to remove them. Manual audits are available via `/audit @user` or the right-click **Apps → Audit user** menu. **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for enforcement and everything else still on the roadmap.
 
 ---
 
@@ -87,26 +87,35 @@ If the bot is in a server that is not listed in `GUILDS`, it is logged as `(not 
 
 When a member joins a **configured** server, the bot:
 
-1. Fetches the full User object once (needed for banner and some profile data not present on the cached Member).
-2. Computes a trust score from account signals and picks a band.
-3. Logs the join to the console: `member joined: <user> (id=…, score=…, band=…)`.
-4. Posts an audit embed to `MOD_CHANNEL_ID` showing every signal, the total score, and the band.
+1. Identifies which invite was used (invite-uses diff against the cache).
+2. Records the join into the `members` table with `joined_at` and `invite_code`.
+3. Fetches the full User object (needed for banner and some profile data not present on the cached Member).
+4. Computes a trust score from all signals and picks a band. Behavioural signals (onboarding speed, first-message timing) read `pending` / `none yet` at this point.
+5. Logs to console and posts an audit embed to the guild's configured mod channel.
+
+Then, as behaviour unfolds:
+
+- **Onboarding completed** (either Rules Screening's `pending` transition or the `COMPLETED_ONBOARDING` member flag) → `onboarding_completed_at` is set; a small notice plus an **updated** audit embed lands in the mod channel with the elapsed duration and a `**speedrun**` / `fast` marker for suspicious times.
+- **First message sent** → `first_message_at` is set; a notice with the message preview (and any attachment/embed count) plus an updated audit embed lands in the mod channel. A first message within 30 seconds of join is flagged `**immediately after join**`.
 
 Bands, from highest score to lowest: `Trusted`, `Likely-safe`, `Neutral`, `Suspicious`, `Malicious`. Thresholds are defined in `scoring.py` and are the initial guess — expect to tune them.
 
 Current signals, defined in `scoring.py`:
 
-| Signal            | Reads                                | Weight range       | Notes                                                                                              |
-|-------------------|--------------------------------------|--------------------|----------------------------------------------------------------------------------------------------|
-| Blocklist         | local SQLite `flags` table           | 0 or −10           | Overrides everything: a flag drops the user to Malicious. Set via `/flag`.                        |
-| Invite            | per-guild invite cache               | 0 (informational)  | Which invite was used, by whom, use count. `unknown` on vanity URL, cold cache, or `/audit` runs.  |
-| Account age       | `member.created_at`                  | −3 to +2           | Days since Discord account creation.                                                               |
-| Avatar            | `member.avatar` + `is_animated()`    | −2, +1, or +2      | Default: −2. Static custom: +1. Animated (Nitro-only): +2.                                         |
-| Banner            | `full_user.banner`                   | 0 or +1            | Custom banner requires Nitro; weak positive.                                                       |
-| Avatar decoration | `member.avatar_decoration`           | 0 or +1            | Overlay around the avatar; Nitro-only.                                                             |
-| Server booster    | `member.premium_since`               | 0 or +3            | Boosting the current guild — strong positive.                                                      |
-| Public flags      | `member.public_flags`                | −1 to +3           | HypeSquad / Nitro Early / Active Developer / etc. Limited set exposed by the API.                 |
-| Username pattern  | regex on `member.name`               | −2 or 0            | Trailing `\d{4,}$` — the `word####` scam signature.                                                |
+| Signal              | Reads                                | Weight range       | Notes                                                                                              |
+|---------------------|--------------------------------------|--------------------|----------------------------------------------------------------------------------------------------|
+| Blocklist           | local SQLite `flags` table           | 0 or −10           | Overrides everything: a flag drops the user to Malicious. Set via `/flag`.                        |
+| Invite              | per-guild invite cache               | 0 (informational)  | Which invite was used, by whom, use count. `unknown` on vanity URL, cold cache, or `/audit` runs.  |
+| Mutual servers      | `member.mutual_guilds` + `bot.guilds` | −2 to +3           | Shared server count with the bot (excluding the current guild). Weak until the bot is in multiple guilds; strong once in several sister communities. |
+| Account age         | `member.created_at`                  | −3 to +2           | Days since Discord account creation.                                                               |
+| Avatar              | `member.avatar` + `is_animated()`    | −2, +1, or +2      | Default: −2. Static custom: +1. Animated (Nitro-only): +2.                                         |
+| Banner              | `full_user.banner`                   | 0 or +1            | Custom banner requires Nitro; weak positive.                                                       |
+| Avatar decoration   | `member.avatar_decoration`           | 0 or +1            | Overlay around the avatar; Nitro-only.                                                             |
+| Server booster      | `member.premium_since`               | 0 or +3            | Boosting the current guild — strong positive.                                                      |
+| Public flags        | `member.public_flags`                | −1 to +3           | HypeSquad / Nitro Early / Active Developer / etc. Limited set exposed by the API.                 |
+| Username pattern    | regex on `member.name`               | −2 or 0            | Trailing `\d{4,}$` — the `word####` scam signature.                                                |
+| Onboarding speed    | `members.onboarding_completed_at`    | −3 to +1           | Seconds between join and onboarding completion. <5s: speedrun. <30s: fast. 30s–30m: normal. >30m: deliberate. |
+| First message timing | `members.first_message_at`          | −2 or 0            | Seconds between join and first message. <30s: posted immediately (bot-like). Otherwise neutral for now — content-based scoring lands with hot triggers. |
 
 The **Discord API deliberately hides several profile signals from bots** (connections such as Twitch or X, nameplate, display-name colour, profile widgets, current Nitro subscription state for other users). Static scoring therefore has a real ceiling; behavioural triggers and a local blocklist (see below) will close the gap for well-disguised accounts.
 
@@ -139,7 +148,7 @@ The blocklist is **global to this bot instance** — a flag added while auditing
 | `bot.py`          | Entry point, Discord client, event handlers, slash commands.                       |
 | `scoring.py`      | Signal functions, `AuditContext` / `Audit` dataclasses, score → band mapping.      |
 | `embeds.py`       | Discord embed formatting for the mod-audit channel.                                |
-| `db.py`           | SQLite schema and CRUD for the `audits` and `flags` tables.                        |
+| `db.py`           | SQLite schema and CRUD for the `audits`, `flags`, and `members` tables.            |
 | `invites.py`      | Per-guild invite-uses cache; identifies which invite each new joiner used.         |
 | `regulus.db`      | SQLite database file (created on first run, gitignored).                           |
 | `requirements.txt`| Python dependencies.                                                               |

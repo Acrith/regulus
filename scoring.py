@@ -32,6 +32,8 @@ class AuditContext:
     full_user: Optional[discord.User] = None
     active_flag: Optional[db.Flag] = None
     used_invite: Optional[discord.Invite] = None
+    total_bot_guilds: int = 1
+    member_record: Optional[db.MemberRecord] = None
 
 
 @dataclass
@@ -41,12 +43,26 @@ class Audit:
     band: str
 
 
+def fmt_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
 def _fmt_age(days: int) -> str:
     if days < 60:
         return f"{days}d"
     if days < 730:
         return f"{days // 30}mo"
     return f"{days // 365}y"
+
+
+def _parse_ts(ts: str) -> datetime:
+    return datetime.fromisoformat(ts)
 
 
 def _signal_blocklist(ctx: AuditContext) -> Signal:
@@ -76,6 +92,27 @@ def _signal_invite(ctx: AuditContext) -> Signal:
         f"`{inv.code}` — by {creator_str}, {inv.uses} uses",
         0,
         prominent=True,
+    )
+
+
+def _signal_mutual_servers(ctx: AuditContext) -> Signal:
+    other_guilds_available = max(0, ctx.total_bot_guilds - 1)
+    if other_guilds_available == 0:
+        return Signal("Mutual servers", "n/a (bot in 1 guild)", 0)
+    mutuals = [g for g in ctx.member.mutual_guilds if g.id != ctx.member.guild.id]
+    n = len(mutuals)
+    if n == 0:
+        weight = -2
+    elif n == 1:
+        weight = 0
+    elif n == 2:
+        weight = 1
+    else:
+        weight = min(n, 3)
+    return Signal(
+        "Mutual servers",
+        f"shares {n} of {other_guilds_available} other bot-guilds",
+        weight,
     )
 
 
@@ -140,9 +177,42 @@ def _signal_username_pattern(ctx: AuditContext) -> Signal:
     return Signal("Username", f"@{ctx.member.name}", 0)
 
 
+def _signal_onboarding_speed(ctx: AuditContext) -> Signal:
+    record = ctx.member_record
+    if record is None:
+        return Signal("Onboarding speed", "no record (joined before bot deployed)", 0)
+    if record.onboarding_completed_at is None:
+        return Signal("Onboarding speed", "pending / not completed", 0)
+    elapsed = (_parse_ts(record.onboarding_completed_at) - _parse_ts(record.joined_at)).total_seconds()
+    if elapsed < 5:
+        weight, note = -3, "speedrun"
+    elif elapsed < 30:
+        weight, note = -1, "fast, no reading"
+    elif elapsed < 30 * 60:
+        weight, note = 0, "normal"
+    else:
+        weight, note = 1, "deliberate"
+    return Signal("Onboarding speed", f"{fmt_duration(elapsed)} — {note}", weight)
+
+
+def _signal_first_message_timing(ctx: AuditContext) -> Signal:
+    record = ctx.member_record
+    if record is None:
+        return Signal("First message", "no record (joined before bot deployed)", 0)
+    if record.first_message_at is None:
+        return Signal("First message", "none yet", 0)
+    elapsed = (_parse_ts(record.first_message_at) - _parse_ts(record.joined_at)).total_seconds()
+    if elapsed < 30:
+        weight, note = -2, "posted immediately"
+    else:
+        weight, note = 0, "posted later"
+    return Signal("First message", f"{fmt_duration(elapsed)} after join — {note}", weight)
+
+
 _SIGNALS = [
     _signal_blocklist,
     _signal_invite,
+    _signal_mutual_servers,
     _signal_account_age,
     _signal_avatar,
     _signal_banner,
@@ -150,6 +220,8 @@ _SIGNALS = [
     _signal_server_booster,
     _signal_public_flags,
     _signal_username_pattern,
+    _signal_onboarding_speed,
+    _signal_first_message_timing,
 ]
 
 
@@ -176,11 +248,14 @@ async def audit(
     except discord.HTTPException:
         pass
     active_flag = await db.get_active_flag(member.id)
+    member_record = await db.get_member_record(member.id, member.guild.id)
     ctx = AuditContext(
         member=member,
         full_user=full_user,
         active_flag=active_flag,
         used_invite=used_invite,
+        total_bot_guilds=len(client.guilds),
+        member_record=member_record,
     )
     signals = [fn(ctx) for fn in _SIGNALS]
     score = sum(s.weight for s in signals)

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Optional
 
 import discord
@@ -11,7 +12,7 @@ from dotenv import load_dotenv
 import db
 import invites
 from embeds import build_audit_embed
-from scoring import Audit, audit
+from scoring import Audit, audit, fmt_duration
 
 load_dotenv()
 
@@ -67,6 +68,14 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _elapsed_since(iso_ts: str) -> float:
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(iso_ts)).total_seconds()
+
+
 async def _record_audit(member: discord.Member, result: Audit, kind: str) -> None:
     signals_data = [
         {"name": s.name, "detail": s.detail, "weight": s.weight}
@@ -80,6 +89,23 @@ async def _record_audit(member: discord.Member, result: Audit, kind: str) -> Non
         band=result.band,
         signals_json=json.dumps(signals_data),
     )
+
+
+async def _post_to_mod_channel(guild_id: int, content: str,
+                                embed: Optional[discord.Embed] = None) -> None:
+    mod_channel_id = GUILDS.get(guild_id)
+    if mod_channel_id is None:
+        return
+    channel = bot.get_channel(mod_channel_id)
+    if channel is None:
+        log.warning("mod channel %s unresolved for guild %s", mod_channel_id, guild_id)
+        return
+    try:
+        await channel.send(content=content, embed=embed)
+    except discord.Forbidden:
+        log.error("cannot post to mod channel: missing permission in #%s", channel.name)
+    except discord.HTTPException as e:
+        log.error("failed to post to mod channel: %s", e)
 
 
 @bot.event
@@ -136,25 +162,110 @@ async def on_member_join(member: discord.Member):
         return
 
     used_invite = await invites.find_used(member.guild)
+    joined_at = (member.joined_at or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+    invite_code = used_invite.code if used_invite else None
+    await db.upsert_member_join(member.id, member.guild.id, joined_at, invite_code)
+
     result = await audit(member, bot, used_invite=used_invite)
     await _record_audit(member, result, "join")
     log.info("member joined: %s (id=%s, guild=%s, score=%+d, band=%s, invite=%s)",
              member, member.id, member.guild.id, result.score, result.band,
-             used_invite.code if used_invite else "unknown")
-
-    channel = bot.get_channel(mod_channel_id)
-    if channel is None:
-        log.error("cannot post audit: mod channel %s unresolved for guild %s",
-                  mod_channel_id, member.guild.id)
-        return
+             invite_code or "unknown")
 
     embed = build_audit_embed(member, result)
     try:
-        await channel.send(embed=embed)
+        channel = bot.get_channel(mod_channel_id)
+        if channel is not None:
+            await channel.send(embed=embed)
     except discord.Forbidden:
-        log.error("cannot post audit: missing permission in #%s", channel.name)
+        log.error("cannot post audit: missing permission in mod channel")
     except discord.HTTPException as e:
         log.error("failed to post audit embed: %s", e)
+
+
+def _detect_onboarding_completed(before: discord.Member, after: discord.Member) -> bool:
+    if before.pending and not after.pending:
+        return True
+    before_done = getattr(before.flags, "completed_onboarding", False)
+    after_done = getattr(after.flags, "completed_onboarding", False)
+    if after_done and not before_done:
+        return True
+    return False
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if after.bot:
+        return
+    if after.guild.id not in GUILDS:
+        return
+    if not _detect_onboarding_completed(before, after):
+        return
+
+    now_iso = _now_iso()
+    set_ok = await db.set_onboarding_completed(after.id, after.guild.id, now_iso)
+    if not set_ok:
+        return
+
+    record = await db.get_member_record(after.id, after.guild.id)
+    elapsed_str = "unknown"
+    note = ""
+    if record is not None:
+        elapsed = _elapsed_since(record.joined_at)
+        elapsed_str = fmt_duration(elapsed)
+        if elapsed < 5:
+            note = " — **speedrun**"
+        elif elapsed < 30:
+            note = " — fast"
+
+    result = await audit(after, bot)
+    await _record_audit(after, result, "onboarding")
+    embed = build_audit_embed(after, result)
+    await _post_to_mod_channel(
+        after.guild.id,
+        f"{after.mention} completed onboarding in {elapsed_str}{note}",
+        embed=embed,
+    )
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or message.guild is None:
+        return
+    if message.guild.id not in GUILDS:
+        return
+
+    record = await db.get_member_record(message.author.id, message.guild.id)
+    if record is None or record.first_message_at is not None:
+        return
+
+    now_iso = _now_iso()
+    set_ok = await db.set_first_message(message.author.id, message.guild.id, now_iso)
+    if not set_ok:
+        return
+
+    elapsed = _elapsed_since(record.joined_at)
+    note = " — **immediately after join**" if elapsed < 30 else ""
+    preview = message.content.strip().replace("\n", " ")
+    if len(preview) > 200:
+        preview = preview[:197] + "..."
+    if not preview and message.attachments:
+        preview = f"({len(message.attachments)} attachment(s), no text)"
+    elif not preview and message.embeds:
+        preview = f"({len(message.embeds)} embed(s), no text)"
+    elif not preview:
+        preview = "(empty)"
+
+    member = message.guild.get_member(message.author.id) or await message.guild.fetch_member(message.author.id)
+    result = await audit(member, bot)
+    await _record_audit(member, result, "first_message")
+    embed = build_audit_embed(member, result)
+    await _post_to_mod_channel(
+        message.guild.id,
+        f"{message.author.mention} first message in {message.channel.mention}, "
+        f"{fmt_duration(elapsed)} after join{note}\n> {preview}",
+        embed=embed,
+    )
 
 
 async def _reply_with_audit(interaction: discord.Interaction, member: discord.Member) -> None:
@@ -163,23 +274,6 @@ async def _reply_with_audit(interaction: discord.Interaction, member: discord.Me
     await _record_audit(member, result, "manual")
     embed = build_audit_embed(member, result)
     await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-async def _post_to_mod_channel(guild_id: int, content: str,
-                                embed: Optional[discord.Embed] = None) -> None:
-    mod_channel_id = GUILDS.get(guild_id)
-    if mod_channel_id is None:
-        return
-    channel = bot.get_channel(mod_channel_id)
-    if channel is None:
-        log.warning("mod channel %s unresolved for guild %s", mod_channel_id, guild_id)
-        return
-    try:
-        await channel.send(content=content, embed=embed)
-    except discord.Forbidden:
-        log.error("cannot post to mod channel: missing permission in #%s", channel.name)
-    except discord.HTTPException as e:
-        log.error("failed to post to mod channel: %s", e)
 
 
 @bot.tree.command(
