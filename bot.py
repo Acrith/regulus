@@ -9,6 +9,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import db
+import invites
 from embeds import build_audit_embed
 from scoring import Audit, audit
 
@@ -106,6 +107,24 @@ async def on_ready():
                             GUILDS[guild.id])
             else:
                 log.info("    mod channel: #%s (id=%s)", channel.name, channel.id)
+            await invites.refresh(guild)
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    log.info("joined new guild: %s (id=%s)", guild.name, guild.id)
+    if guild.id in GUILDS:
+        await invites.refresh(guild)
+
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    invites.note_created(invite)
+
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    invites.note_deleted(invite)
 
 
 @bot.event
@@ -116,10 +135,12 @@ async def on_member_join(member: discord.Member):
     if mod_channel_id is None:
         return
 
-    result = await audit(member, bot)
+    used_invite = await invites.find_used(member.guild)
+    result = await audit(member, bot, used_invite=used_invite)
     await _record_audit(member, result, "join")
-    log.info("member joined: %s (id=%s, guild=%s, score=%+d, band=%s)",
-             member, member.id, member.guild.id, result.score, result.band)
+    log.info("member joined: %s (id=%s, guild=%s, score=%+d, band=%s, invite=%s)",
+             member, member.id, member.guild.id, result.score, result.band,
+             used_invite.code if used_invite else "unknown")
 
     channel = bot.get_channel(mod_channel_id)
     if channel is None:

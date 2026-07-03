@@ -2,7 +2,7 @@
 
 Trust-tier moderation bot for Discord community servers. Designed to defend against scam-account raids by auditing new joiners against configurable signals, gating channel access behind an `@Unverified` role, and escalating suspicious accounts to moderator review.
 
-**Status: shadow-mode audit + local blocklist.** On member join the bot computes a trust score from account signals (blocklist match, age, avatar, animated-avatar, banner, avatar decoration, server-boost status, public flags, username pattern), maps it to a band, and posts an audit embed to a configured moderator channel. Every audit — automatic or manual — is persisted to a local SQLite database. Moderators can `/flag @user` to add someone to the blocklist (auto-Malicious on future audits) or `/unflag @user` to remove them. Manual audits are available via `/audit @user` or the right-click **Apps → Audit user** menu. **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for enforcement and everything else still on the roadmap.
+**Status: shadow-mode audit + local blocklist + invite tracking.** On member join the bot computes a trust score from account signals (blocklist match, age, avatar, animated-avatar, banner, avatar decoration, server-boost status, public flags, username pattern), identifies the invite used, maps the score to a band, and posts an audit embed to a configured moderator channel. Every audit — automatic or manual — is persisted to a local SQLite database. Moderators can `/flag @user` to add someone to the blocklist (auto-Malicious on future audits) or `/unflag @user` to remove them. Manual audits are available via `/audit @user` or the right-click **Apps → Audit user** menu. **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for enforcement and everything else still on the roadmap.
 
 ---
 
@@ -96,16 +96,17 @@ Bands, from highest score to lowest: `Trusted`, `Likely-safe`, `Neutral`, `Suspi
 
 Current signals, defined in `scoring.py`:
 
-| Signal            | Reads                                | Weight range       | Notes                                                                              |
-|-------------------|--------------------------------------|--------------------|------------------------------------------------------------------------------------|
-| Blocklist         | local SQLite `flags` table           | 0 or −10           | Overrides everything: a flag drops the user to Malicious. Set via `/flag`.        |
-| Account age       | `member.created_at`                  | −3 to +2           | Days since Discord account creation.                                               |
-| Avatar            | `member.avatar` + `is_animated()`    | −2, +1, or +2      | Default: −2. Static custom: +1. Animated (Nitro-only): +2.                         |
-| Banner            | `full_user.banner`                   | 0 or +1            | Custom banner requires Nitro; weak positive.                                       |
-| Avatar decoration | `member.avatar_decoration`           | 0 or +1            | Overlay around the avatar; Nitro-only.                                             |
-| Server booster    | `member.premium_since`               | 0 or +3            | Boosting the current guild — strong positive.                                      |
-| Public flags      | `member.public_flags`                | −1 to +3           | HypeSquad / Nitro Early / Active Developer / etc. Limited set exposed by the API. |
-| Username pattern  | regex on `member.name`               | −2 or 0            | Trailing `\d{4,}$` — the `word####` scam signature.                                |
+| Signal            | Reads                                | Weight range       | Notes                                                                                              |
+|-------------------|--------------------------------------|--------------------|----------------------------------------------------------------------------------------------------|
+| Blocklist         | local SQLite `flags` table           | 0 or −10           | Overrides everything: a flag drops the user to Malicious. Set via `/flag`.                        |
+| Invite            | per-guild invite cache               | 0 (informational)  | Which invite was used, by whom, use count. `unknown` on vanity URL, cold cache, or `/audit` runs.  |
+| Account age       | `member.created_at`                  | −3 to +2           | Days since Discord account creation.                                                               |
+| Avatar            | `member.avatar` + `is_animated()`    | −2, +1, or +2      | Default: −2. Static custom: +1. Animated (Nitro-only): +2.                                         |
+| Banner            | `full_user.banner`                   | 0 or +1            | Custom banner requires Nitro; weak positive.                                                       |
+| Avatar decoration | `member.avatar_decoration`           | 0 or +1            | Overlay around the avatar; Nitro-only.                                                             |
+| Server booster    | `member.premium_since`               | 0 or +3            | Boosting the current guild — strong positive.                                                      |
+| Public flags      | `member.public_flags`                | −1 to +3           | HypeSquad / Nitro Early / Active Developer / etc. Limited set exposed by the API.                 |
+| Username pattern  | regex on `member.name`               | −2 or 0            | Trailing `\d{4,}$` — the `word####` scam signature.                                                |
 
 The **Discord API deliberately hides several profile signals from bots** (connections such as Twitch or X, nameplate, display-name colour, profile widgets, current Nitro subscription state for other users). Static scoring therefore has a real ceiling; behavioural triggers and a local blocklist (see below) will close the gap for well-disguised accounts.
 
@@ -139,6 +140,7 @@ The blocklist is **global to this bot instance** — a flag added while auditing
 | `scoring.py`      | Signal functions, `AuditContext` / `Audit` dataclasses, score → band mapping.      |
 | `embeds.py`       | Discord embed formatting for the mod-audit channel.                                |
 | `db.py`           | SQLite schema and CRUD for the `audits` and `flags` tables.                        |
+| `invites.py`      | Per-guild invite-uses cache; identifies which invite each new joiner used.         |
 | `regulus.db`      | SQLite database file (created on first run, gitignored).                           |
 | `requirements.txt`| Python dependencies.                                                               |
 | `.env.example`    | Template for local configuration (copy to `.env`).                                 |

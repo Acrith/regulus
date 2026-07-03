@@ -7,7 +7,7 @@ score maps to a band. Bands are informational in shadow mode.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -23,6 +23,7 @@ class Signal:
     name: str
     detail: str
     weight: int
+    prominent: bool = False
 
 
 @dataclass
@@ -30,6 +31,7 @@ class AuditContext:
     member: discord.Member
     full_user: Optional[discord.User] = None
     active_flag: Optional[db.Flag] = None
+    used_invite: Optional[discord.Invite] = None
 
 
 @dataclass
@@ -56,7 +58,25 @@ def _signal_blocklist(ctx: AuditContext) -> Signal:
     detail = f"flagged {date}: {reason}"
     if len(detail) > 100:
         detail = detail[:97] + "..."
-    return Signal("Blocklist", detail, -10)
+    return Signal("Blocklist", detail, -10, prominent=True)
+
+
+def _signal_invite(ctx: AuditContext) -> Signal:
+    inv = ctx.used_invite
+    if inv is None:
+        return Signal("Invite", "unknown (vanity URL, cold cache, or retroactive audit)",
+                       0, prominent=True)
+    creator = inv.inviter
+    if creator is None:
+        creator_str = "unknown"
+    else:
+        creator_str = f"{creator.mention} (@{creator.name})"
+    return Signal(
+        "Invite",
+        f"`{inv.code}` — by {creator_str}, {inv.uses} uses",
+        0,
+        prominent=True,
+    )
 
 
 def _signal_account_age(ctx: AuditContext) -> Signal:
@@ -122,6 +142,7 @@ def _signal_username_pattern(ctx: AuditContext) -> Signal:
 
 _SIGNALS = [
     _signal_blocklist,
+    _signal_invite,
     _signal_account_age,
     _signal_avatar,
     _signal_banner,
@@ -144,14 +165,23 @@ def _band_for(score: int) -> str:
     return "Malicious"
 
 
-async def audit(member: discord.Member, client: discord.Client) -> Audit:
+async def audit(
+    member: discord.Member,
+    client: discord.Client,
+    used_invite: Optional[discord.Invite] = None,
+) -> Audit:
     full_user: Optional[discord.User] = None
     try:
         full_user = await client.fetch_user(member.id)
     except discord.HTTPException:
         pass
     active_flag = await db.get_active_flag(member.id)
-    ctx = AuditContext(member=member, full_user=full_user, active_flag=active_flag)
+    ctx = AuditContext(
+        member=member,
+        full_user=full_user,
+        active_flag=active_flag,
+        used_invite=used_invite,
+    )
     signals = [fn(ctx) for fn in _SIGNALS]
     score = sum(s.weight for s in signals)
     return Audit(signals=signals, score=score, band=_band_for(score))
