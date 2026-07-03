@@ -516,6 +516,36 @@ _UNVERIFIED_DENY_KEYS = (
 )
 
 _CHANNEL_MENTION_RE = re.compile(r"<#(\d+)>")
+_ROLE_MENTION_RE = re.compile(r"<@&(\d+)>")
+
+
+def _resolve_role_reference(
+    raw: str,
+    guild: discord.Guild,
+) -> tuple[Optional[discord.Role], str]:
+    """Resolve a user-supplied role reference to (existing Role or None, name).
+
+    Accepts:
+      - A role mention (`<@&ID>`), auto-completed by the slash-command UI
+        when the operator types `@`. Looked up by ID.
+      - A plain name (`Unverified`), optionally with a leading `@`.
+
+    If a mention resolves to a real role in the guild, returns that role
+    and its current name. If it resolves to a role that no longer exists,
+    returns (None, "") to signal the caller should error out. If the input
+    is a plain name, returns any existing role with that name (or None to
+    signal "create it").
+    """
+    ref = raw.strip()
+    mention_match = _ROLE_MENTION_RE.fullmatch(ref)
+    if mention_match is not None:
+        role_id = int(mention_match.group(1))
+        role = guild.get_role(role_id)
+        if role is None:
+            return None, ""
+        return role, role.name
+    name = ref.lstrip("@")
+    return discord.utils.get(guild.roles, name=name), name
 
 
 def _parse_open_channels(raw: str, guild: discord.Guild) -> set[str]:
@@ -558,7 +588,7 @@ def _make_unverified_overwrite(can_view: bool, is_voice: bool) -> discord.Permis
     description="Create the @Unverified role and apply deny overrides guild-wide.",
 )
 @app_commands.describe(
-    role_name="Name for the role (default: Unverified)",
+    role_name="Role to use. New name (e.g. 'Unverified') or an existing role's @mention.",
     open_channels="Channels Unverified can still view (comma-separated). Names or #mentions both work.",
 )
 @app_commands.default_permissions(manage_guild=True)
@@ -588,12 +618,18 @@ async def setup_unverified_command(
 
     open_names = _parse_open_channels(open_channels, guild)
 
-    role = discord.utils.get(guild.roles, name=role_name)
+    role, resolved_role_name = _resolve_role_reference(role_name, guild)
+    if _ROLE_MENTION_RE.fullmatch(role_name.strip()) is not None and role is None:
+        await interaction.followup.send(
+            "The role you mentioned does not exist in this guild.",
+            ephemeral=True,
+        )
+        return
     created = False
     if role is None:
         try:
             role = await guild.create_role(
-                name=role_name,
+                name=resolved_role_name,
                 color=discord.Color.from_rgb(180, 90, 90),
                 hoist=False,
                 mentionable=False,
