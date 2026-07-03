@@ -2,7 +2,7 @@
 
 Trust-tier moderation bot for Discord community servers. Designed to defend against scam-account raids by auditing new joiners against configurable signals, gating channel access behind an `@Unverified` role, and escalating suspicious accounts to moderator review.
 
-**Status: shadow-mode audit.** On member join the bot computes a trust score from static account signals (age, avatar, public flags, username pattern), maps it to a band, and posts a signed audit embed to a configured moderator channel. Moderators can also rerun the audit against any member on demand via `/audit @user` or the right-click **Apps → Audit user** menu (both are mod-only and reply ephemerally). **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for the enforcement layer and everything else still on the roadmap.
+**Status: shadow-mode audit.** On member join the bot computes a trust score from account signals (age, avatar, animated-avatar, banner, avatar decoration, server-boost status, public flags, username pattern), maps it to a band, and posts an audit embed to a configured moderator channel. Moderators can also rerun the audit against any member on demand via `/audit @user` or the right-click **Apps → Audit user** menu (both are mod-only and reply ephemerally). **The score is informational only — no roles are assigned, no automatic actions are taken.** See [Design (planned)](#design-planned) below for the enforcement layer and everything else still on the roadmap.
 
 ---
 
@@ -69,11 +69,26 @@ INFO  regulus    mod channel: #<name> (id=…)
 
 When a member joins the configured server, the bot:
 
-1. Computes a trust score from account signals and picks a band.
-2. Logs the join to the console: `member joined: <user> (id=…, score=…, band=…)`.
-3. Posts an audit embed to `MOD_CHANNEL_ID` showing every signal, the total score, and the band.
+1. Fetches the full User object once (needed for banner and some profile data not present on the cached Member).
+2. Computes a trust score from account signals and picks a band.
+3. Logs the join to the console: `member joined: <user> (id=…, score=…, band=…)`.
+4. Posts an audit embed to `MOD_CHANNEL_ID` showing every signal, the total score, and the band.
 
 Bands, from highest score to lowest: `Trusted`, `Likely-safe`, `Neutral`, `Suspicious`, `Malicious`. Thresholds are defined in `scoring.py` and are the initial guess — expect to tune them.
+
+Current signals, defined in `scoring.py`:
+
+| Signal            | Reads                                | Weight range       | Notes                                                              |
+|-------------------|--------------------------------------|--------------------|--------------------------------------------------------------------|
+| Account age       | `member.created_at`                  | −3 to +2           | Days since Discord account creation.                               |
+| Avatar            | `member.avatar` + `is_animated()`    | −2, +1, or +2      | Default: −2. Static custom: +1. Animated (Nitro-only): +2.         |
+| Banner            | `full_user.banner`                   | 0 or +1            | Custom banner requires Nitro; weak positive.                       |
+| Avatar decoration | `member.avatar_decoration`           | 0 or +1            | Overlay around the avatar; Nitro-only.                             |
+| Server booster    | `member.premium_since`               | 0 or +3            | Boosting the current guild — strong positive.                      |
+| Public flags      | `member.public_flags`                | −1 to +3           | HypeSquad / Nitro Early / Active Developer / etc. Limited set exposed by the API. |
+| Username pattern  | regex on `member.name`               | −2 or 0            | Trailing `\d{4,}$` — the `word####` scam signature.                |
+
+The **Discord API deliberately hides several profile signals from bots** (connections such as Twitch or X, nameplate, display-name colour, profile widgets, current Nitro subscription state for other users). Static scoring therefore has a real ceiling; behavioural triggers and a local blocklist (see below) will close the gap for well-disguised accounts.
 
 Stop the bot with `Ctrl+C`.
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Optional
 
 import discord
 
@@ -37,7 +38,7 @@ def _fmt_age(days: int) -> str:
     return f"{days // 365}y"
 
 
-def _signal_account_age(member: discord.Member) -> Signal:
+def _signal_account_age(member: discord.Member, full_user: Optional[discord.User]) -> Signal:
     age_days = (datetime.now(timezone.utc) - member.created_at).days
     if age_days < 30:
         weight = -3
@@ -52,13 +53,37 @@ def _signal_account_age(member: discord.Member) -> Signal:
     return Signal("Account age", _fmt_age(age_days), weight)
 
 
-def _signal_avatar(member: discord.Member) -> Signal:
+def _signal_avatar(member: discord.Member, full_user: Optional[discord.User]) -> Signal:
     if member.avatar is None:
         return Signal("Avatar", "default", -2)
+    if member.avatar.is_animated():
+        return Signal("Avatar", "animated (Nitro)", 2)
     return Signal("Avatar", "custom", 1)
 
 
-def _signal_public_flags(member: discord.Member) -> Signal:
+def _signal_banner(member: discord.Member, full_user: Optional[discord.User]) -> Signal:
+    banner = getattr(full_user, "banner", None) if full_user else None
+    if banner is None:
+        return Signal("Banner", "none", 0)
+    return Signal("Banner", "custom", 1)
+
+
+def _signal_avatar_decoration(member: discord.Member, full_user: Optional[discord.User]) -> Signal:
+    deco = getattr(member, "avatar_decoration", None)
+    if deco is None and full_user is not None:
+        deco = getattr(full_user, "avatar_decoration", None)
+    if deco is None:
+        return Signal("Avatar decoration", "none", 0)
+    return Signal("Avatar decoration", "present", 1)
+
+
+def _signal_server_booster(member: discord.Member, full_user: Optional[discord.User]) -> Signal:
+    if member.premium_since is None:
+        return Signal("Server booster", "no", 0)
+    return Signal("Server booster", "yes", 3)
+
+
+def _signal_public_flags(member: discord.Member, full_user: Optional[discord.User]) -> Signal:
     active = member.public_flags.all()
     if not active:
         return Signal("Public flags", "none", -1)
@@ -67,7 +92,7 @@ def _signal_public_flags(member: discord.Member) -> Signal:
     return Signal("Public flags", names, weight)
 
 
-def _signal_username_pattern(member: discord.Member) -> Signal:
+def _signal_username_pattern(member: discord.Member, full_user: Optional[discord.User]) -> Signal:
     if _USERNAME_TRAILING_DIGITS.match(member.name):
         return Signal("Username", f"@{member.name} — trailing digits", -2)
     return Signal("Username", f"@{member.name}", 0)
@@ -76,6 +101,9 @@ def _signal_username_pattern(member: discord.Member) -> Signal:
 _SIGNALS = [
     _signal_account_age,
     _signal_avatar,
+    _signal_banner,
+    _signal_avatar_decoration,
+    _signal_server_booster,
     _signal_public_flags,
     _signal_username_pattern,
 ]
@@ -93,7 +121,12 @@ def _band_for(score: int) -> str:
     return "Malicious"
 
 
-def audit(member: discord.Member) -> Audit:
-    signals = [fn(member) for fn in _SIGNALS]
+async def audit(member: discord.Member, client: discord.Client) -> Audit:
+    full_user: Optional[discord.User] = None
+    try:
+        full_user = await client.fetch_user(member.id)
+    except discord.HTTPException:
+        pass
+    signals = [fn(member, full_user) for fn in _SIGNALS]
     score = sum(s.weight for s in signals)
     return Audit(signals=signals, score=score, band=_band_for(score))

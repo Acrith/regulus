@@ -61,7 +61,7 @@ async def on_member_join(member: discord.Member):
     if member.bot:
         return
 
-    result = audit(member)
+    result = await audit(member, bot)
     log.info("member joined: %s (id=%s, score=%+d, band=%s)",
              member, member.id, result.score, result.band)
 
@@ -80,9 +80,10 @@ async def on_member_join(member: discord.Member):
 
 
 async def _reply_with_audit(interaction: discord.Interaction, member: discord.Member) -> None:
-    result = audit(member)
+    await interaction.response.defer(ephemeral=True)
+    result = await audit(member, bot)
     embed = build_audit_embed(member, result)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
