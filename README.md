@@ -136,6 +136,7 @@ Both commands reply ephemerally so the target member cannot see the response, an
 |--------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | `/audit member:@user`                      | Runs the trust audit on `@user` and returns the audit embed ephemerally.                                       |
 | Right-click a user → **Apps → Audit user** | Same as `/audit`, invoked via context menu.                                                                    |
+| `/audit-id user_id:<int>`                  | Audits any Discord user by raw ID — works for banned/left users. Member-only signals (server booster, live onboarding state) return `n/a`; historical DB data still contributes. |
 | `/flag member:@user reason:"..."`          | Adds the user to the blocklist. Posts a public notice + updated audit embed to the mod channel.                |
 | `/unflag member:@user`                     | Deactivates all active flags for the user. Posts a public notice to the mod channel.                           |
 

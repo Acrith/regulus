@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Union
 
 import discord
 
@@ -28,7 +28,9 @@ class Signal:
 
 @dataclass
 class AuditContext:
-    member: discord.Member
+    user: discord.User  # always present (Member is a User)
+    guild_id: int
+    member: Optional[discord.Member] = None  # None if user is not a current member of guild_id
     full_user: Optional[discord.User] = None
     active_flag: Optional[db.Flag] = None
     used_invite: Optional[discord.Invite] = None
@@ -105,7 +107,7 @@ def _signal_mutual_servers(ctx: AuditContext) -> Signal:
     other_guilds_available = max(0, ctx.total_bot_guilds - 1)
     if other_guilds_available == 0:
         return Signal("Mutual servers", "n/a (bot in 1 guild)", 0)
-    mutuals = [g for g in ctx.member.mutual_guilds if g.id != ctx.member.guild.id]
+    mutuals = [g for g in ctx.user.mutual_guilds if g.id != ctx.guild_id]
     n = len(mutuals)
     return Signal(
         "Mutual servers",
@@ -115,7 +117,7 @@ def _signal_mutual_servers(ctx: AuditContext) -> Signal:
 
 
 def _signal_account_age(ctx: AuditContext) -> Signal:
-    age_days = (datetime.now(timezone.utc) - ctx.member.created_at).days
+    age_days = (datetime.now(timezone.utc) - ctx.user.created_at).days
     if age_days < 30:
         weight = -3
     elif age_days < 90:
@@ -130,7 +132,7 @@ def _signal_account_age(ctx: AuditContext) -> Signal:
 
 
 def _signal_avatar(ctx: AuditContext) -> Signal:
-    avatar = ctx.member.avatar
+    avatar = ctx.user.avatar
     if avatar is None:
         return Signal("Avatar", "default", -2)
     if avatar.is_animated():
@@ -146,7 +148,7 @@ def _signal_banner(ctx: AuditContext) -> Signal:
 
 
 def _signal_avatar_decoration(ctx: AuditContext) -> Signal:
-    deco = getattr(ctx.member, "avatar_decoration", None)
+    deco = getattr(ctx.user, "avatar_decoration", None)
     if deco is None and ctx.full_user is not None:
         deco = getattr(ctx.full_user, "avatar_decoration", None)
     if deco is None:
@@ -155,13 +157,15 @@ def _signal_avatar_decoration(ctx: AuditContext) -> Signal:
 
 
 def _signal_server_booster(ctx: AuditContext) -> Signal:
+    if ctx.member is None:
+        return Signal("Server booster", "n/a (not in current guild)", 0)
     if ctx.member.premium_since is None:
         return Signal("Server booster", "no", 0)
     return Signal("Server booster", "yes", 3)
 
 
 def _signal_public_flags(ctx: AuditContext) -> Signal:
-    active = ctx.member.public_flags.all()
+    active = ctx.user.public_flags.all()
     if not active:
         return Signal("Public flags", "none", -1)
     names = ", ".join(f.name.replace("_", " ") for f in active[:4])
@@ -170,15 +174,18 @@ def _signal_public_flags(ctx: AuditContext) -> Signal:
 
 
 def _signal_username_pattern(ctx: AuditContext) -> Signal:
-    if _USERNAME_TRAILING_DIGITS.match(ctx.member.name):
-        return Signal("Username", f"@{ctx.member.name} — trailing digits", -2)
-    return Signal("Username", f"@{ctx.member.name}", 0)
+    if _USERNAME_TRAILING_DIGITS.match(ctx.user.name):
+        return Signal("Username", f"@{ctx.user.name} — trailing digits", -2)
+    return Signal("Username", f"@{ctx.user.name}", 0)
 
 
 def _signal_onboarding_speed(ctx: AuditContext) -> Signal:
     record = ctx.member_record
-    member = ctx.member
-    completed_flag = getattr(member.flags, "completed_onboarding", False)
+    completed_flag = (
+        getattr(ctx.member.flags, "completed_onboarding", False)
+        if ctx.member else False
+    )
+    pending = ctx.member.pending if ctx.member else False
 
     if record is None:
         if completed_flag:
@@ -201,8 +208,10 @@ def _signal_onboarding_speed(ctx: AuditContext) -> Signal:
     if completed_flag:
         return Signal("Onboarding speed",
                        "completed (timing missed — bot was down for the event)", 0)
-    if member.pending:
+    if pending:
         return Signal("Onboarding speed", "still pending screening", 0)
+    if ctx.member is None:
+        return Signal("Onboarding speed", "unknown (user not in current guild)", 0)
     return Signal("Onboarding speed",
                    "not completed or no screening required", 0)
 
@@ -255,6 +264,35 @@ def _band_for(score: int) -> str:
     return "Malicious"
 
 
+def _compute_audit(ctx: AuditContext) -> Audit:
+    signals = [fn(ctx) for fn in _SIGNALS]
+    score = sum(s.weight for s in signals)
+    return Audit(signals=signals, score=score, band=_band_for(score))
+
+
+async def _build_context(
+    user: discord.User,
+    guild_id: int,
+    member: Optional[discord.Member],
+    full_user: Optional[discord.User],
+    used_invite: Optional[discord.Invite],
+    client: discord.Client,
+) -> AuditContext:
+    active_flag = await db.get_active_flag(user.id)
+    member_record = await db.get_member_record(user.id, guild_id)
+    return AuditContext(
+        user=user,
+        guild_id=guild_id,
+        member=member,
+        full_user=full_user,
+        active_flag=active_flag,
+        used_invite=used_invite,
+        total_bot_guilds=len(client.guilds),
+        member_record=member_record,
+        client=client,
+    )
+
+
 async def audit(
     member: discord.Member,
     client: discord.Client,
@@ -265,17 +303,45 @@ async def audit(
         full_user = await client.fetch_user(member.id)
     except discord.HTTPException:
         pass
-    active_flag = await db.get_active_flag(member.id)
-    member_record = await db.get_member_record(member.id, member.guild.id)
-    ctx = AuditContext(
+    ctx = await _build_context(
+        user=member,
+        guild_id=member.guild.id,
         member=member,
         full_user=full_user,
-        active_flag=active_flag,
         used_invite=used_invite,
-        total_bot_guilds=len(client.guilds),
-        member_record=member_record,
         client=client,
     )
-    signals = [fn(ctx) for fn in _SIGNALS]
-    score = sum(s.weight for s in signals)
-    return Audit(signals=signals, score=score, band=_band_for(score))
+    return _compute_audit(ctx)
+
+
+async def audit_by_user_id(
+    user_id: int,
+    guild_id: int,
+    client: discord.Client,
+) -> Optional[Audit]:
+    """Audit any Discord user by ID, including banned/left users.
+
+    Returns None if the user ID doesn't resolve to a Discord user at all.
+    Member-only signals (server booster, live onboarding state) return
+    n/a for users not currently in the guild; historical data from the
+    members table still contributes when available.
+    """
+    try:
+        user = await client.fetch_user(user_id)
+    except discord.NotFound:
+        return None
+    except discord.HTTPException:
+        return None
+
+    guild = client.get_guild(guild_id)
+    member = guild.get_member(user_id) if guild else None
+
+    ctx = await _build_context(
+        user=user,
+        guild_id=guild_id,
+        member=member,
+        full_user=user,
+        used_invite=None,
+        client=client,
+    )
+    return _compute_audit(ctx)

@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 import db
 import invites
 from embeds import build_audit_embed
-from scoring import Audit, audit, fmt_duration
+from scoring import Audit, audit, audit_by_user_id, fmt_duration
 
 load_dotenv()
 
@@ -332,6 +332,60 @@ async def audit_command(interaction: discord.Interaction, member: discord.Member
 @app_commands.checks.has_permissions(moderate_members=True)
 async def audit_context_menu(interaction: discord.Interaction, member: discord.Member) -> None:
     await _reply_with_audit(interaction, member)
+
+
+@bot.tree.command(
+    name="audit-id",
+    description="Run the trust audit on any user by ID (works for banned/left users).",
+)
+@app_commands.describe(
+    user_id="User ID to audit. Right-click a message or user in Discord, then Copy User ID."
+)
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(moderate_members=True)
+async def audit_id_command(interaction: discord.Interaction, user_id: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    try:
+        parsed_id = int(user_id.strip())
+    except ValueError:
+        await interaction.followup.send(
+            f"`{user_id}` is not a valid user ID — expected a number.",
+            ephemeral=True,
+        )
+        return
+
+    result = await audit_by_user_id(parsed_id, interaction.guild.id, bot)
+    if result is None:
+        await interaction.followup.send(
+            f"No Discord user found with ID `{parsed_id}`.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        user = await bot.fetch_user(parsed_id)
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "Could not fetch user data for the embed.",
+            ephemeral=True,
+        )
+        return
+
+    signals_data = [
+        {"name": s.name, "detail": s.detail, "weight": s.weight}
+        for s in result.signals
+    ]
+    await db.record_audit(
+        user_id=parsed_id,
+        guild_id=interaction.guild.id,
+        kind="manual-id",
+        score=result.score,
+        band=result.band,
+        signals_json=json.dumps(signals_data),
+    )
+    embed = build_audit_embed(user, result)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(

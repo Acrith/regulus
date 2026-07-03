@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Union
+
 import discord
 
 from scoring import Audit
@@ -15,25 +17,27 @@ _BAND_COLOR = {
 }
 
 
-def build_audit_embed(member: discord.Member, result: Audit) -> discord.Embed:
-    created_ts = int(member.created_at.timestamp())
+def build_audit_embed(
+    subject: Union[discord.Member, discord.User],
+    result: Audit,
+) -> discord.Embed:
+    created_ts = int(subject.created_at.timestamp())
     embed = discord.Embed(
-        title=f"New join: {member.name}",
+        title=f"New join: {subject.name}",
         description=(
-            f"{member.mention}  •  ID `{member.id}`\n"
+            f"{subject.mention}  •  ID `{subject.id}`\n"
             f"Created <t:{created_ts}:R>  (<t:{created_ts}:f>)"
         ),
         color=_BAND_COLOR.get(result.band, discord.Color.light_grey()),
         timestamp=discord.utils.utcnow(),
     )
-    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_thumbnail(url=subject.display_avatar.url)
     embed.add_field(
         name="Score",
         value=f"**{result.score:+d}**  —  {result.band}",
         inline=False,
     )
     for signal in result.signals:
-        # Blocklist row is prominent only when actually flagged
         prominent = signal.prominent and not (
             signal.name == "Blocklist" and signal.weight == 0
         )
