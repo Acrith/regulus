@@ -111,14 +111,19 @@ Stop the bot with `Ctrl+C`.
 
 ## Moderator commands
 
-Available to any user with the `Manage Messages` permission (adjustable per-command in **Server Settings → Integrations → Regulus**). Both reply ephemerally so the target member cannot see the response.
+Available to any user with the `Moderate Members` (timeout) permission. This is Discord's designated moderator-tier permission and is enforced two ways:
 
-| Trigger                                 | Effect                                                            |
-|-----------------------------------------|-------------------------------------------------------------------|
-| `/audit member:@user`                   | Runs the trust audit on `@user` and returns the audit embed.      |
-| Right-click a user → **Apps → Audit user** | Same as `/audit`, invoked via context menu.                     |
+- **Default permission** on the command — hides it from non-mods in the picker and blocks execution.
+- **Code-level check** on every invocation — refuses even if the default permission is overridden in **Server Settings → Integrations → Regulus**.
 
-Commands are guild-scoped and sync at startup for every server listed in `GUILDS` — they appear in Discord within a second or two of the bot connecting.
+Both commands reply ephemerally so the target member cannot see the response, and both are guild-only (no DM invocation).
+
+| Trigger                                    | Effect                                                        |
+|--------------------------------------------|---------------------------------------------------------------|
+| `/audit member:@user`                      | Runs the trust audit on `@user` and returns the audit embed.  |
+| Right-click a user → **Apps → Audit user** | Same as `/audit`, invoked via context menu.                   |
+
+Commands are guild-scoped and sync at startup for every server listed in `GUILDS` — they appear in Discord within a second or two of the bot connecting. Users without the required permission get a clean ephemeral refusal message.
 
 ## Repository layout
 

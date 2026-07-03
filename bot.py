@@ -125,15 +125,38 @@ async def _reply_with_audit(interaction: discord.Interaction, member: discord.Me
     description="Run the trust audit on a member and show the result.",
 )
 @app_commands.describe(member="The member to audit")
-@app_commands.default_permissions(manage_messages=True)
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(moderate_members=True)
 async def audit_command(interaction: discord.Interaction, member: discord.Member) -> None:
     await _reply_with_audit(interaction, member)
 
 
 @bot.tree.context_menu(name="Audit user")
-@app_commands.default_permissions(manage_messages=True)
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(moderate_members=True)
 async def audit_context_menu(interaction: discord.Interaction, member: discord.Member) -> None:
     await _reply_with_audit(interaction, member)
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You do not have permission to use this command."
+    elif isinstance(error, app_commands.NoPrivateMessage):
+        message = "This command can only be used in a server."
+    else:
+        log.exception("app command error: %s", error)
+        message = "Something went wrong running that command."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 if __name__ == "__main__":
