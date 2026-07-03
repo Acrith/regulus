@@ -107,10 +107,11 @@ Current signals, defined in `scoring.py`:
 
 | Signal              | Reads                                | Weight range       | Notes                                                                                              |
 |---------------------|--------------------------------------|--------------------|----------------------------------------------------------------------------------------------------|
-| Blocklist           | local SQLite `flags` table           | 0 or −10           | Overrides everything: a flag drops the user to Malicious. Set via `/flag`.                        |
+| Blocklist           | local SQLite `flags` table           | 0 or −10           | Overrides everything: any active flag drops the user to Malicious. Row shows every guild the user is currently flagged in, each with actor + date + reason. |
 | Invite              | per-guild invite cache               | 0 (informational)  | Which invite was used, by whom, use count. `unknown` on vanity URL, cold cache, or `/audit` runs.  |
 | Mutual servers      | `member.mutual_guilds` + `bot.guilds` | 0 (informational)  | Shared server count with the bot (excluding the current guild). Currently unweighted — penalising 0 mutuals only makes sense once the bot is in several sister communities. Re-enable a negative weight for 0 mutuals when the bot is running on 4+ sister servers. |
 | Account age         | `member.created_at`                  | −3 to +2           | Days since Discord account creation.                                                               |
+| Server tenure       | `members.joined_at`                  | 0 to +3            | How long they've been a member of this specific guild. <30d = 0. <6mo = +1. <1y = +2. 1y+ = +3. Fights against a false-positive Blocklist hit for long-time members whose accounts were hijacked — the audit shows both signals side by side. |
 | Avatar              | `member.avatar` + `is_animated()`    | −2, +1, or +2      | Default: −2. Static custom: +1. Animated (Nitro-only): +2.                                         |
 | Banner              | `full_user.banner`                   | 0 or +1            | Custom banner requires Nitro; weak positive.                                                       |
 | Avatar decoration   | `member.avatar_decoration`           | 0 or +1            | Overlay around the avatar; Nitro-only.                                                             |
