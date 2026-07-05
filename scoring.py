@@ -262,8 +262,13 @@ def _signal_onboarding_speed(ctx: AuditContext) -> Signal:
             weight, note = -1, "fast, no reading"
         elif elapsed < 30 * 60:
             weight, note = 0, "normal"
-        else:
+        elif elapsed < 30 * 86400:
             weight, note = 1, "deliberate"
+        else:
+            # Stamped by a legacy code path before the retroactive-detect
+            # guard existed. Weight 0 so it stops inflating scores; the
+            # detail explains the reading.
+            weight, note = 0, "retroactive (stale timing — pre-guard stamp)"
         return Signal("Onboarding speed", f"{fmt_duration(elapsed)} — {note}", weight)
 
     if completed_flag:

@@ -431,6 +431,9 @@ def _detect_onboarding_completed(before: discord.Member, after: discord.Member) 
     return False
 
 
+_ONBOARDING_FRESH_WINDOW_SECONDS = 24 * 3600
+
+
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     if after.bot:
@@ -440,21 +443,40 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     if not _detect_onboarding_completed(before, after):
         return
 
-    now_iso = _now_iso()
-    set_ok = await db.set_onboarding_completed(after.id, after.guild.id, now_iso)
-    if not set_ok:
+    record = await db.get_member_record(after.id, after.guild.id)
+    if record is None:
+        return
+    if record.onboarding_completed_at is not None:
+        return  # already stamped
+
+    elapsed = _elapsed_since(record.joined_at)
+
+    # Retroactive path: Discord occasionally backfills the
+    # COMPLETED_ONBOARDING member flag for existing dormant members long
+    # after they actually joined. Treating that as a fresh completion
+    # would (a) stamp a nonsense onboarding-speed reading like 763 days
+    # and (b) post a "New join" audit embed for someone who has been
+    # here for years. Instead: log a short notice for mod visibility
+    # and let the signal render "completed (timing missed)" until an
+    # explicit /audit reveals more.
+    if elapsed > _ONBOARDING_FRESH_WINDOW_SECONDS:
+        await _post_notice(
+            after.guild.id,
+            f"{after.mention} completed onboarding **retroactively** "
+            f"({fmt_duration(elapsed)} after join). Likely a Discord "
+            f"backfill on an existing member — no fresh audit posted.",
+        )
         return
 
-    record = await db.get_member_record(after.id, after.guild.id)
-    elapsed_str = "unknown"
+    now_iso = _now_iso()
+    await db.set_onboarding_completed(after.id, after.guild.id, now_iso)
+
+    elapsed_str = fmt_duration(elapsed)
     note = ""
-    if record is not None:
-        elapsed = _elapsed_since(record.joined_at)
-        elapsed_str = fmt_duration(elapsed)
-        if elapsed < 5:
-            note = " — **speedrun**"
-        elif elapsed < 30:
-            note = " — fast"
+    if elapsed < 5:
+        note = " — **speedrun**"
+    elif elapsed < 30:
+        note = " — fast"
 
     result = await audit(after, bot)
     await _record_audit(after.id, after.guild.id, result, "onboarding")
