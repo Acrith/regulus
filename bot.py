@@ -378,6 +378,18 @@ async def on_member_ban(guild: discord.Guild, user: Union[discord.User, discord.
     if len(reason_text) > 180:
         reason_text = reason_text[:177] + "..."
 
+    existing = await db.get_active_flags(user.id)
+    already_here = any(f.guild_id == guild.id for f in existing)
+
+    if already_here:
+        await _post_notice(
+            guild.id,
+            f"<@{actor_id}> banned <@{user.id}> (`{user.id}`) via Discord — "
+            f"already on this guild's blocklist, no duplicate added.\n"
+            f"Reason: {reason_text}",
+        )
+        return
+
     await db.add_flag(
         user_id=user.id,
         guild_id=guild.id,
